@@ -162,6 +162,7 @@ class Orchestrator:
                 project_path=project_path,
                 max_turns=max_turns,
                 execute_timeout=execute_timeout,
+                task_id=task_path.stem,
             )
             
             # Verification
@@ -203,6 +204,7 @@ class Orchestrator:
         project_path: Path,
         max_turns: int,
         execute_timeout: int,
+        task_id: str | None = None,
     ) -> tuple[bool, str, list[str]]:
         """Run the AI agent loop."""
         messages = [{"role": "system", "content": prompt}]
@@ -216,6 +218,9 @@ class Orchestrator:
             except RuntimeError as e:
                 return False, f"No workers available: {e}", changed_files
             
+            # Persist turn progress (CRASH RESILIENCE per SPEC.md)
+            self.persist_turn_progress(task_id, turn, messages, response)
+            
             # Parse action
             action = parse_action(response)
             if not action:
@@ -226,6 +231,9 @@ class Orchestrator:
             # Execute action
             obs = self._execute_action(action, project_path, execute_timeout, read_files, changed_files)
             
+            # Persist after action too
+            self.persist_turn_progress(task_id, turn, messages, obs, is_observation=True)
+            
             # Check for final
             if action.action == "final":
                 return True, action.result or obs, changed_files
@@ -235,6 +243,45 @@ class Orchestrator:
             messages.append({"role": "user", "content": obs})
         
         return False, f"Hit {max_turns} turn limit", changed_files
+    
+    def persist_turn_progress(
+        self,
+        task_id: str | None,
+        turn: int,
+        messages: list[dict],
+        last_response: str,
+        is_observation: bool = False,
+    ) -> None:
+        """
+        Write transcript to disk after every turn (CRASH RESILIENCE per SPEC.md).
+        
+        Persists the conversation transcript so that if the process crashes,
+        progress can be recovered. Files are written to _backups/ with a
+        naming convention that allows identification and resumption.
+        """
+        if task_id is None:
+            return
+        
+        backup_dir = self.vault_root / "_backups"
+        backup_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        role = "obs" if is_observation else "turn"
+        progress_file = backup_dir / f"progress_{task_id}_{turn}_{role}_{timestamp}.json"
+        
+        data = {
+            "task_id": task_id,
+            "turn": turn,
+            "is_observation": is_observation,
+            "timestamp": timestamp,
+            "messages": messages,
+            "last_response": last_response,
+        }
+        
+        try:
+            progress_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass  # Don't fail on persistence errors
     
     def _execute_action(
         self,

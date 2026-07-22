@@ -16,7 +16,7 @@ DANGEROUS_PATTERNS = [
     r"\bshutdown\b",
     r"\breboot\b",
     r"curl\b.*\|\s*ba?sh",
-    r"wget\b.*\|\s*ba?sh",
+    r"wget\b.*[|\s]+\s*(ba?sh|sh|python|perl|ruby)",
 ]
 DANGEROUS_RE = re.compile("|".join(DANGEROUS_PATTERNS), re.IGNORECASE)
 

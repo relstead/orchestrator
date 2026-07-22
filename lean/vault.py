@@ -44,6 +44,9 @@ def ensure_vault_skeleton(vault_root: Path) -> None:
             p.write_text("", encoding="utf-8")
     safe_vault_path(vault_root, "Projects").mkdir(exist_ok=True)
     safe_vault_path(vault_root, "_backups").mkdir(exist_ok=True)
+    safe_vault_path(vault_root, "_archive").mkdir(exist_ok=True)
+    safe_vault_path(vault_root, "_archive/_digest").mkdir(exist_ok=True)
+    safe_vault_path(vault_root, "Skills").mkdir(exist_ok=True)
 
 
 def ensure_project_skeleton(vault_root: Path, project_name: str) -> Path:
@@ -57,6 +60,9 @@ def ensure_project_skeleton(vault_root: Path, project_name: str) -> Path:
         p = project_dir / f
         if not p.exists():
             p.write_text("", encoding="utf-8")
+    # Create project archive directory per SPEC.md
+    archive_dir = safe_vault_path(vault_root, f"_archive/{project_name}")
+    archive_dir.mkdir(parents=True, exist_ok=True)
     return project_dir
 
 

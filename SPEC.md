@@ -19,6 +19,142 @@ separate context store.
 
 ---
 
+## User Workflow
+
+This section describes the intended user experience, from installation to ongoing use.
+
+### 1. Installation & Setup
+
+```bash
+# Install the app
+pip install lean  # or: python -m pip install lean
+
+# Initialize a vault (creates folder structure)
+lean init ~/my-vault
+```
+
+### 2. Configure API Keys
+
+Edit `~/my-vault/config.json` to add API keys:
+
+```json
+{
+  "workers": [
+    {
+      "name": "groq-free",
+      "model": "llama-3.1-8b-instant",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key": "gsk_xxxxx"
+    }
+  ]
+}
+```
+
+**Free tier providers** (no API key required or free tier available):
+- Groq (free tier with Llama models)
+- OpenRouter (free models available)
+- OpenAI (free trial)
+- Anthropic (free trial)
+
+### 3. Start the Orchestrator
+
+```bash
+# Run the orchestrator (stays in background)
+lean run ~/my-vault
+
+# Check status
+lean status ~/my-vault
+```
+
+The orchestrator will:
+- Auto-create vault structure if not present
+- Scan for tasks every second
+- Respect rate limits (429 = cooldown, 401/403 = disable)
+- Dispatch tasks to available workers in parallel
+
+### 4. Open in Obsidian
+
+1. Open Obsidian
+2. "Open folder as vault"
+3. Select `~/my-vault`
+4. See the vault structure in the file explorer
+
+### 5. Add Tasks (No AI Required)
+
+**Option A: Add via inbox (auto-converted to tasks)**
+```markdown
+# In _inbox.md
+Fix the login bug
+Add dark mode support
+Update documentation
+```
+*Note: Inbox processing is planned but not yet implemented.*
+
+**Option B: Add via `lean add` CLI**
+```bash
+lean add ~/my-vault "Fix the login bug" my-project
+```
+
+**Option C: Manual task file**
+Create `Projects/my-project/tasks/pending/my-task.md`:
+```markdown
+Fix the login bug
+
+Fix the authentication flow that's rejecting valid credentials.
+```
+
+### 6. Automatic Project Detection
+
+When you create a new folder under `Projects/`:
+```
+Projects/
+  new-project/   ← Created manually or by Obsidian
+```
+
+The orchestrator detects this on the next scan and auto-populates:
+```
+Projects/new-project/
+  assets/
+  NOTES.md
+  STATUS.md
+  tasks/
+    pending/
+    doing/
+    done/
+    blocked/
+    waiting/
+```
+
+*Note: Auto-detection is planned but not yet implemented. Use `lean add` or create files manually.*
+
+### 7. Task Lifecycle (Visible in Obsidian)
+
+| Folder | Meaning |
+|--------|---------|
+| `pending/` | Waiting to be processed |
+| `doing/` | Currently being worked on by a worker |
+| `done/` | Successfully completed |
+| `failed/` | Failed after max attempts |
+| `waiting/` | Blocked waiting for human input |
+| `blocked/` | Dependency not satisfied |
+
+You can drag files between folders manually — the app will respect external changes.
+
+### 8. Monitor Progress
+
+```bash
+lean status ~/my-vault
+# Output:
+# Vault: /home/user/my-vault
+# Tasks:
+#   Pending: 5
+#   Running: 2
+#   Done: 12
+#   Failed: 1
+```
+
+---
+
 ## Architectural Invariants
 
 The following principles are expected to remain true regardless of future features.
@@ -189,3 +325,49 @@ Key decisions:
 - In-memory job tracking with file persistence for crash recovery
 - DAG built from `depends-on:` fields (not AI hallucinated)
 - Verification is code (pytest), not AI reviewer
+
+---
+
+## Implementation Status
+
+### ✅ Implemented
+
+| Feature | Status | Location |
+|---------|--------|----------|
+| Vault structure creation | ✅ | `vault.py: ensure_vault_skeleton()` |
+| Task lifecycle (pending→doing→done) | ✅ | `tasks.py` |
+| Parallel task dispatch | ✅ | `orchestrator.py: _run()` |
+| Worker pool with rate limit handling | ✅ | `worker.py` |
+| Path containment (security) | ✅ | `vault.py: safe_vault_path()` |
+| Command sandboxing | ✅ | `sandbox.py` |
+| Snapshot/rollback | ✅ | `rollback.py` |
+| Dependency graph (DAG) | ✅ | `dependency.py` |
+| Code relevance search | ✅ | `indexer.py` |
+| pytest verification | ✅ | `verification.py` |
+| Self-test suite | ✅ | `self_test.py` |
+| CLI (init, run, status, add) | ✅ | `cli.py` |
+
+### 🔄 Planned (Not Yet Implemented)
+
+| Feature | Description |
+|---------|-------------|
+| Inbox processing | Auto-convert `_inbox.md` entries to tasks |
+| Auto-project detection | Detect new folders under `Projects/` and auto-populate |
+| Digest generation | Auto-update `_digest.md` with activity feed |
+| STATUS.md compaction | Auto-compact large STATUS.md files |
+| Configuration UI | GUI for editing config without JSON |
+| Background service | Proper daemon/service mode |
+
+### 🔧 How to Implement Missing Features
+
+**Inbox Processing:**
+1. Add `process_inbox()` function in `orchestrator.py`
+2. Scan `_inbox.md` for new lines (vs `_inbox_archive.md`)
+3. Create task files for each new line
+4. Append to `_inbox_archive.md` with timestamp
+
+**Auto-Project Detection:**
+1. Add `detect_new_projects()` in `orchestrator.py`
+2. On each scan, compare `Projects/` folder list to known projects
+3. Call `ensure_project_skeleton()` for new folders
+4. Store known projects in `_active.md` or separate tracking file

@@ -136,14 +136,11 @@ class Orchestrator:
         
         task_path = claimed
         
-        # Update attempts
-        task.attempts += 1
-        txt = task.raw_text
-        txt = json.loads(json.dumps(txt))  # Reset state
-        # Re-read and update meta
-        txt = parse_task(task_path).raw_text
+        # Update attempts - re-parse after claim to get fresh state
         from .tasks import set_meta
-        new_txt = set_meta(txt, task.task_type, task.attempts)
+        task = parse_task(task_path)
+        task.attempts += 1
+        new_txt = set_meta(task.raw_text, task.task_type, task.attempts)
         task_path.write_text(new_txt)
         
         self.log(f"Executing: {task.body[:50]}... (attempt {task.attempts}/{max_attempts})")
@@ -293,7 +290,27 @@ class Orchestrator:
     ) -> str:
         """Execute a single action."""
         
-        if action.action == "read":
+        if action.action == "list":
+            # Return shallow map of vault (per SPEC.md)
+            parts = ["# Vault Structure"]
+            for p in sorted(project_path.rglob("*")):
+                if p.is_file() and not any(s in p.parts for s in ["__pycache__", ".git", "node_modules"]):
+                    depth = len(p.relative_to(project_path).parts) - 1
+                    prefix = "  " * depth + ("📄 " if p.suffix in [".py", ".js", ".ts", ".md"] else "📁 ")
+                    parts.append(f"{prefix}{p.name}")
+                elif p.is_dir() and not any(s in p.parts for s in ["__pycache__", ".git", "node_modules", "tasks"]):
+                    depth = len(p.relative_to(project_path).parts)
+                    parts.append("  " * depth + "📂/")
+            return "\n".join(parts[:100])  # Limit output
+        
+        elif action.action == "ask_human":
+            # Park task in waiting/ for human response (per SPEC.md)
+            from .tasks import release_task
+            release_task(project_path / "tasks" / "doing" / f"{action.path or 'current'}.md", 
+                        back_to_pending=False)  # back_to_pending=False goes to waiting/
+            return "PARKED: Task moved to waiting/ - await human response"
+        
+        elif action.action == "read":
             if not action.path:
                 return "ERROR: no path"
             target = safe_vault_path(project_path, action.path)
@@ -346,8 +363,6 @@ class Orchestrator:
 
     def _run(self) -> None:
         """Main polling loop."""
-        stale_interval = self.config.get("stale_claim_minutes", 30) * 60
-        
         while not self._stop.is_set():
             # Recover stale tasks
             self._sweep_stale_claims(max_age_minutes=self.config.get("stale_claim_minutes", 30))
@@ -382,7 +397,11 @@ class Orchestrator:
 
     def _execute_and_release(self, task_path: Path, worker) -> None:
         """Execute task and release worker."""
+        success = False
         try:
             result = self.execute_task(task_path)
+            success = result.success
+        except Exception:
+            success = False
         finally:
-            worker.finish_job(success=result.success)
+            worker.finish_job(success=success)

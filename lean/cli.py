@@ -10,13 +10,12 @@ def init(path: str) -> None:
     vault = Path(path).expanduser().absolute()
     vault.mkdir(parents=True, exist_ok=True)
     
-    # Create structure
-    (vault / "pending").mkdir(exist_ok=True)
-    (vault / "doing").mkdir(exist_ok=True)
-    (vault / "done").mkdir(exist_ok=True)
-    (vault / "failed").mkdir(exist_ok=True)
+    # Create structure matching SPEC.md and ensure_vault_skeleton
     (vault / "Projects").mkdir(exist_ok=True)
     (vault / "_backups").mkdir(exist_ok=True)
+    (vault / "_archive").mkdir(exist_ok=True)
+    (vault / "_archive/_digest").mkdir(exist_ok=True)
+    (vault / "Skills").mkdir(exist_ok=True)
     
     # Default config
     import json
@@ -44,6 +43,8 @@ def init(path: str) -> None:
     (default_proj / "STATUS.md").write_text("")
     for sub in ("tasks/pending", "tasks/doing", "tasks/done", "tasks/blocked", "tasks/waiting"):
         (default_proj / sub).mkdir(parents=True, exist_ok=True)
+    # Project archive directory
+    (vault / "_archive" / "default").mkdir(exist_ok=True)
     
     print(f"Vault initialized at: {vault}")
     print("Edit config.json to add your API keys and workers.")

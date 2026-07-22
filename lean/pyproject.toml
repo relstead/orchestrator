@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vault-lean"
+version = "1.0.0"
+description = "Lean vault orchestrator - hybrid deterministic/AI architecture"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+lean = "lean.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lean*"]

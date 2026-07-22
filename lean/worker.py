@@ -322,3 +322,73 @@ class WorkerPool:
                 continue
         
         raise RuntimeError(f"All workers failed: {last_error}")
+    
+    def call_with(
+        self,
+        worker: "Worker",
+        messages: list[dict],
+        max_tokens: int = 2000,
+        timeout: int = 90,
+    ) -> tuple["Worker", str, float]:
+        """
+        Call a specific worker directly (no selection logic).
+        
+        Used when a worker has already been reserved for a task.
+        The caller is responsible for ensuring the worker is available.
+        
+        Returns (worker, response_text, cost_usd).
+        Raises RuntimeError on failure.
+        """
+        import requests
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {worker.api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": worker.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            
+            resp = requests.post(
+                f"{worker.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            
+            if resp.status_code == 429:
+                retry_after = 60
+                if "Retry-After" in resp.headers:
+                    retry_after = int(resp.headers["Retry-After"])
+                worker.set_cooldown(retry_after)
+                worker.record_failure()
+                raise RuntimeError(f"Rate limited ({retry_after}s)")
+            
+            if resp.status_code in (401, 402, 403):
+                worker.enabled = False
+                worker.status = WorkerStatus.DISABLED
+                worker.record_failure()
+                raise RuntimeError(f"Auth error ({resp.status_code})")
+            
+            resp.raise_for_status()
+            data = resp.json()
+            
+            worker.finish_reason = data.get("choices", [{}])[0].get("finish_reason")
+            worker.usage = data.get("usage", {})
+            
+            # Calculate and return cost
+            cost = self.estimate_cost(worker.usage)
+            
+            return worker, data["choices"][0]["message"]["content"], cost
+        
+        except requests.Timeout:
+            worker.record_failure()
+            raise RuntimeError("Request timeout")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            worker.record_failure()
+            raise RuntimeError(str(e))

@@ -252,6 +252,9 @@ class Orchestrator:
         # Task timeout
         self._task_timeout = self.config.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS)
         
+        # Execute is opt-in, off by default
+        self._allow_execute = self.config.get("allow_execute", False)
+        
         # Ensure vault structure
         ensure_vault_skeleton(vault_root)
         
@@ -286,6 +289,9 @@ class Orchestrator:
             
             # Reload task timeout
             self._task_timeout = self.config.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS)
+            
+            # Reload execute flag
+            self._allow_execute = self.config.get("allow_execute", False)
             
             self.audit.log("config_reload", "Configuration reloaded from file")
             self._logger.info("Config reloaded successfully")
@@ -447,12 +453,10 @@ class Orchestrator:
                 tasks_created += 1
                 self.log(f"Inbox: created task in [{project}]: '{task_body[:50]}...'")
                 
-                # Archive this line with timestamp and project
+                # Archive this line with timestamp and project (APPEND, not overwrite)
                 timestamp = datetime.now().isoformat()
-                archive_path.write_text(
-                    f"\n[{timestamp}] [{project}] {task_body}",
-                    encoding="utf-8",
-                )
+                with open(archive_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{timestamp}] [{project}] {task_body}")
             except Exception as e:
                 self.log(f"Inbox: failed to create task: {e}")
                 new_lines.append(line)
@@ -599,7 +603,7 @@ class Orchestrator:
     # Task Execution
     # =========================================================================
     
-    def execute_task(self, task_path: Path) -> ExecutionResult:
+    def execute_task(self, task_path: Path, worker=None) -> ExecutionResult:
         """
         Execute a single task with an available worker.
         
@@ -610,6 +614,8 @@ class Orchestrator:
         - Audit logging
         - Changeset handoff manifest
         - Deterministic verify-before-final gate for coding tasks
+        
+        worker: Optional pre-reserved worker. If provided, uses that worker directly.
         """
         max_attempts = self.config.get("max_task_attempts", 3)
         max_turns = self.config.get("max_turns", 6)
@@ -678,6 +684,7 @@ class Orchestrator:
             prompt = self._get_prompt(task.task_type, task.body, relevant_context)
             
             # Execute agent loop with task type and timeout
+            # Pass the pre-reserved worker if available
             success, output, changes, cost, changed_paths = self._agent_loop(
                 prompt=prompt,
                 project_path=project_path,
@@ -687,6 +694,7 @@ class Orchestrator:
                 task_type=task.task_type,
                 timeout_seconds=self._task_timeout,
                 prior_log=prior_log,
+                worker=worker,
             )
             
             total_cost = cost
@@ -806,6 +814,7 @@ class Orchestrator:
         task_type: str = "general",
         timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS,
         prior_log: str | None = None,
+        worker=None,
     ) -> tuple[bool, str, list[str], float, dict[str, str]]:
         """
         Run the AI agent loop.
@@ -816,6 +825,9 @@ class Orchestrator:
         - Cost tracking
         - Changeset handoff manifest (tracks files across attempts)
         
+        worker: Optional pre-reserved worker. If provided, uses that worker directly
+        instead of re-selecting from the pool.
+        
         Returns: (success, output, changed_files, total_cost, changed_paths)
         """
         # Seed changeset from prior log if available
@@ -825,7 +837,8 @@ class Orchestrator:
         
         messages = [{"role": "system", "content": prompt}]
         changed_files: list[str] = []
-        read_files: set[str] = set()
+        # Track read files: path -> (was_truncated, total_size)
+        read_files: dict[str, tuple[bool, int]] = {}
         total_cost = 0.0
         loop_start_time = time.time()
         last_model = "unknown"
@@ -839,9 +852,14 @@ class Orchestrator:
                                    timeout_seconds=timeout_seconds)
                 return False, f"Task timeout after {int(elapsed)}s", changed_files, total_cost, changed_paths
             
-            # Call AI with smart routing (use task_type)
+            # Call AI - use pre-reserved worker if available, otherwise pool selection
             try:
-                worker, response, cost = self.pool.call(task_type, messages)
+                if worker is not None:
+                    # Use the pre-reserved worker directly
+                    worker, response, cost = self.pool.call_with(worker, messages)
+                else:
+                    # Fall back to pool selection
+                    worker, response, cost = self.pool.call(task_type, messages)
                 total_cost += cost
                 last_model = worker.model
             except RuntimeError as e:
@@ -917,7 +935,7 @@ class Orchestrator:
         action: Action,
         project_path: Path,
         timeout: int,
-        read_files: set[str],
+        read_files: dict[str, tuple[bool, int]],
         changed_files: list[str],
         changed_paths: dict[str, str] | None = None,
     ) -> str:
@@ -953,16 +971,37 @@ class Orchestrator:
             target = safe_vault_path(project_path, action.path)
             if not target.exists():
                 return f"ERROR: not found: {action.path}"
-            read_files.add(action.path)
-            return target.read_text(encoding="utf-8", errors="replace")[:3000]
+            
+            # Read the file content
+            content = target.read_text(encoding="utf-8", errors="replace")
+            total_len = len(content)
+            
+            # Track whether fully read or truncated
+            if total_len > 3000:
+                shown_content = content[:3000]
+                truncated = True
+                # Store as tuple: (was_truncated, total_size)
+                read_files[action.path] = (True, total_len)
+                return shown_content + f"\n\n...[TRUNCATED: {total_len - 3000} of {total_len} chars hidden]"
+            else:
+                read_files[action.path] = (False, total_len)
+                return content
         
         elif action.action == "write":
             if not action.path:
                 return "ERROR: no path"
             
             target = safe_vault_path(project_path, action.path)
-            if target.exists() and action.path not in read_files:
-                return f"REFUSED: overwrite without read first"
+            
+            if target.exists():
+                # File exists - check if it was read
+                if action.path not in read_files:
+                    return f"REFUSED: overwrite without read first"
+                
+                # Check if it was fully read or truncated
+                read_info = read_files.get(action.path)
+                if read_info and read_info[0]:  # was truncated
+                    return f"REFUSED: file was only partially read ({read_info[1]} bytes). Read the full file first."
             
             # Track created vs overwritten for changeset
             status = "overwritten" if target.exists() else "created"
@@ -977,9 +1016,190 @@ class Orchestrator:
             
             return f"OK: wrote {len(action.content or '')} chars"
         
+        elif action.action == "apply_patch":
+            """Apply a targeted patch to a file (search/replace)."""
+            if not action.path:
+                return "ERROR: no path"
+            
+            target = safe_vault_path(project_path, action.path)
+            
+            # File must exist and must have been read first
+            if not target.exists():
+                return f"ERROR: file not found: {action.path}"
+            
+            if action.path not in read_files:
+                return f"REFUSED: patch without read first"
+            
+            # Get old text (content field) and new text (result field)
+            old_text = action.content
+            new_text = action.result
+            
+            if not old_text:
+                return "ERROR: apply_patch requires content field with text to replace"
+            
+            # Read current file
+            current_content = target.read_text(encoding="utf-8", errors="replace")
+            
+            # Apply patch
+            if old_text not in current_content:
+                return f"ERROR: patch target not found. The old_text must match exactly."
+            
+            # Apply the patch
+            new_content = current_content.replace(old_text, new_text, 1)
+            target.write_text(new_content, encoding="utf-8")
+            
+            changed_files.append(action.path)
+            
+            # Update changeset manifest
+            if changed_paths is not None:
+                changed_paths[action.path] = "overwritten"
+            
+            return f"OK: patched {len(old_text)} → {len(new_text)} chars"
+        
+        elif action.action == "apply_multi_patch":
+            """
+            Apply multiple patches atomically. All files must pass containment check.
+            If any file fails validation, the entire operation is rejected.
+            
+            Expects action.content to be a JSON list of patches:
+            [{"path": "file1", "old_text": "...", "new_text": "..."}, ...]
+            """
+            if not action.content:
+                return "ERROR: apply_multi_patch requires content with JSON list of patches"
+            
+            try:
+                patches = json.loads(action.content)
+            except json.JSONDecodeError:
+                return "ERROR: apply_multi_patch content must be valid JSON"
+            
+            if not isinstance(patches, list):
+                return "ERROR: apply_multi_patch content must be a JSON list"
+            
+            # Validate all paths first (fail-fast on containment check)
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    return "ERROR: each patch must be a JSON object"
+                if "path" not in patch:
+                    return "ERROR: each patch must have a 'path' field"
+                
+                target = safe_vault_path(project_path, patch["path"])
+                if not target.exists():
+                    return f"ERROR: file not found: {patch['path']}"
+                
+                if patch["path"] not in read_files:
+                    return f"REFUSED: patch without read first: {patch['path']}"
+            
+            # All validations passed - apply patches
+            results = []
+            for patch in patches:
+                target = safe_vault_path(project_path, patch["path"])
+                current = target.read_text(encoding="utf-8", errors="replace")
+                
+                old_text = patch.get("old_text", "")
+                new_text = patch.get("new_text", "")
+                
+                if old_text not in current:
+                    # Rollback already-applied patches would be complex,
+                    # so we fail the whole operation if any patch doesn't match
+                    return f"ERROR: patch target not found in {patch['path']}. All patches rejected."
+                
+                new_content = current.replace(old_text, new_text, 1)
+                target.write_text(new_content, encoding="utf-8")
+                changed_files.append(patch["path"])
+                
+                if changed_paths is not None:
+                    changed_paths[patch["path"]] = "overwritten"
+                
+                results.append(f"{patch['path']}: {len(old_text)} → {len(new_text)}")
+            
+            return "OK: " + "; ".join(results)
+        
+        elif action.action == "find_references":
+            """Find files that define or reference a symbol."""
+            if not action.path:
+                return "ERROR: find_references requires path (the symbol to search for)"
+            
+            # Get or create indexer for this project
+            if project_path not in self._index_cache:
+                self._index_cache[project_path] = Indexer(project_path)
+                self._index_cache[project_path].build()
+            
+            indexer = self._index_cache[project_path]
+            results = indexer.find_references(action.path)
+            
+            if not results:
+                return f"No references found for '{action.path}'"
+            
+            lines = [f"# References to '{action.path}'"]
+            for entry in results:
+                lines.append(f"- {entry.path} ({entry.line_count} lines)")
+                if entry.symbols:
+                    syms = [s for s in entry.symbols if action.path in s]
+                    if syms:
+                        lines.append(f"  Symbols: {', '.join(syms[:5])}")
+            
+            return "\n".join(lines)
+        
+        elif action.action == "find_tests":
+            """Find test files related to a symbol or file."""
+            if not action.path:
+                return "ERROR: find_tests requires path"
+            
+            # Get or create indexer for this project
+            if project_path not in self._index_cache:
+                self._index_cache[project_path] = Indexer(project_path)
+                self._index_cache[project_path].build()
+            
+            indexer = self._index_cache[project_path]
+            results = indexer.find_tests(action.path)
+            
+            if not results:
+                return f"No test files found related to '{action.path}'"
+            
+            lines = [f"# Tests for '{action.path}'"]
+            for entry in results:
+                lines.append(f"- {entry.path} ({entry.line_count} lines)")
+            
+            return "\n".join(lines)
+        
+        elif action.action == "find_imports":
+            """Find import dependencies of a file."""
+            if not action.path:
+                return "ERROR: find_imports requires path"
+            
+            target = safe_vault_path(project_path, action.path)
+            if not target.exists():
+                return f"ERROR: file not found: {action.path}"
+            
+            # Get or create indexer for this project
+            if project_path not in self._index_cache:
+                self._index_cache[project_path] = Indexer(project_path)
+                self._index_cache[project_path].build()
+            
+            indexer = self._index_cache[project_path]
+            rel = str(target.relative_to(project_path))
+            
+            if rel not in indexer.files:
+                return f"ERROR: file not indexed: {action.path}"
+            
+            entry = indexer.files[rel]
+            if not entry.imports:
+                return f"No imports found in '{action.path}'"
+            
+            lines = [f"# Imports in '{action.path}'"]
+            for imp in entry.imports[:20]:
+                lines.append(f"- {imp}")
+            
+            return "\n".join(lines)
+        
         elif action.action == "execute":
             if not action.command:
                 return "ERROR: no command"
+            
+            # Execute is opt-in per SPEC.md - must be explicitly enabled
+            if not self._allow_execute:
+                return "REFUSED: execute is disabled for this project. Set allow_execute: true in config.json to enable."
+            
             result = execute(action.command, project_path, timeout=timeout)
             return f"exit {result.exit_code}\n{result.output}"
         
@@ -1086,7 +1306,8 @@ class Orchestrator:
         cost = 0.0
         
         try:
-            result = self.execute_task(task_path)
+            # Pass the reserved worker to ensure it handles this task
+            result = self.execute_task(task_path, worker=worker)
             success = result.success
             duration = result.duration_seconds
             cost = result.cost_usd

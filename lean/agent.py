@@ -19,6 +19,7 @@ SYSTEM_PROMPT = """You are a coding assistant. Complete tasks by taking actions.
 Actions (respond with JSON):
 {"reasoning": "why", "action": "read", "path": "file"}
 {"reasoning": "why", "action": "write", "path": "file", "content": "..."}
+{"reasoning": "why", "action": "apply_patch", "path": "file", "content": "old_text", "result": "new_text"}
 {"reasoning": "why", "action": "execute", "command": "shell command"}
 {"reasoning": "why", "action": "final", "result": "summary"}
 {"reasoning": "why", "action": "list"}
@@ -26,6 +27,7 @@ Actions (respond with JSON):
 
 Rules:
 - Read before write (overwrites existing)
+- apply_patch: use for targeted edits; must match old_text exactly
 - Execute runs in project folder
 - Call final when task complete"""
 

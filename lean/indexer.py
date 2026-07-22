@@ -1,12 +1,14 @@
 """Code indexing for deterministic relevance search.
 
 No AI involved - pure text matching to find relevant files.
+Enhanced with jedi for Python symbol/import analysis.
 """
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -17,11 +19,20 @@ class FileEntry:
     language: str | None
     symbols: list[str]
     line_count: int
+    imports: list[str] = field(default_factory=list)  # Python imports
+    references: dict[str, list[str]] = field(default_factory=dict)  # symbol -> [files that reference it]
 
 
 # Code extensions
 CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs", ".rb", ".php"}
 SKIP_EXTENSIONS = {".png", ".jpg", ".gif", ".pdf", ".zip", ".exe", ".pyc", ".mp3", ".mp4"}
+
+# Try to import jedi for enhanced Python analysis
+try:
+    import jedi
+    JEDI_AVAILABLE = True
+except ImportError:
+    JEDI_AVAILABLE = False
 
 
 class Indexer:
@@ -31,11 +42,13 @@ class Indexer:
         self.project_path = project_path
         self.files: dict[str, FileEntry] = {}
         self.keywords: dict[str, set[str]] = {}
+        self._symbol_index: dict[str, set[str]] = {}  # symbol name -> files
 
     def build(self) -> None:
         """Build index of all files in project."""
         self.files.clear()
         self.keywords.clear()
+        self._symbol_index.clear()
         
         skip_dirs = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".pytest_cache"}
         
@@ -52,6 +65,9 @@ class Indexer:
                 continue
             
             self._index_file(path)
+        
+        # Build cross-reference index
+        self._build_references()
 
     def _index_file(self, path: Path) -> None:
         """Index a single file."""
@@ -64,7 +80,7 @@ class Indexer:
         
         lines = content.split("\n")
         lang = self._detect_language(path)
-        symbols = self._extract_symbols(content, lang)
+        symbols, imports = self._extract_symbols_and_imports(content, lang, path)
         
         entry = FileEntry(
             path=rel,
@@ -72,6 +88,7 @@ class Indexer:
             language=lang,
             symbols=symbols,
             line_count=len(lines),
+            imports=imports,
         )
         
         self.files[rel] = entry
@@ -82,6 +99,19 @@ class Indexer:
             if word not in self.keywords:
                 self.keywords[word] = set()
             self.keywords[word].add(rel)
+        
+        # Index symbols for fast lookup
+        for sym in symbols:
+            if sym not in self._symbol_index:
+                self._symbol_index[sym] = set()
+            self._symbol_index[sym].add(rel)
+
+    def _build_references(self) -> None:
+        """Build cross-reference index for symbol references."""
+        for path, entry in self.files.items():
+            entry.references = {}
+            for sym in entry.symbols:
+                entry.references[sym] = []
 
     def _detect_language(self, path: Path) -> str | None:
         """Detect language from extension."""
@@ -89,13 +119,46 @@ class Indexer:
         return {".py": "python", ".js": "javascript", ".ts": "typescript",
                 ".go": "go", ".rs": "rust", ".java": "java"}.get(ext)
 
-    def _extract_symbols(self, content: str, lang: str | None) -> list[str]:
-        """Extract class/function names."""
+    def _extract_symbols_and_imports(self, content: str, lang: str | None, path: Path) -> tuple[list[str], list[str]]:
+        """Extract class/function names and imports.
+        
+        Uses jedi for Python if available, falls back to regex.
+        """
+        imports = []
+        
         if lang == "python":
-            return re.findall(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)", content, re.MULTILINE)[:50]
+            # Try jedi first for accurate analysis
+            if JEDI_AVAILABLE:
+                try:
+                    script = jedi.Script(content, path=str(path))
+                    definitions = script.get_names(all_scopes=True)
+                    
+                    symbols = []
+                    for d in definitions:
+                        # Only include top-level definitions
+                        if d.type in ("class", "function", "async_function"):
+                            symbols.append(d.name)
+                    
+                    # Get imports
+                    for d in definitions:
+                        if d.type == "import":
+                            imports.append(d.name)
+                    
+                    return list(dict.fromkeys(symbols))[:50], imports[:30]
+                except Exception:
+                    pass  # Fall back to regex
+            
+            # Fallback: regex-based extraction
+            symbols = re.findall(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)", content, re.MULTILINE)[:50]
+            imports = re.findall(r"^\s*(?:from\s+(\S+)|import\s+(\S+))", content, re.MULTILINE)
+            imports = [imp[0] or imp[1] for imp in imports if imp][-30:]
+            return symbols, imports
+        
         elif lang in ("javascript", "typescript"):
-            return re.findall(r"^\s*(?:export\s+)?(?:function|const|class)\s+(\w+)", content, re.MULTILINE)[:50]
-        return []
+            symbols = re.findall(r"^\s*(?:export\s+)?(?:function|const|class)\s+(\w+)", content, re.MULTILINE)[:50]
+            return symbols, []
+        
+        return [], []
 
     def _extract_words(self, content: str) -> set[str]:
         """Extract significant words.
@@ -145,6 +208,34 @@ class Indexer:
         
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [self.files[p] for p, _ in ranked[:top_n]]
+
+    def find_references(self, symbol: str) -> list[FileEntry]:
+        """Find all files that define or reference a symbol.
+        
+        Uses the symbol index for fast lookup.
+        """
+        if symbol in self._symbol_index:
+            files = self._symbol_index[symbol]
+            return [self.files[f] for f in files if f in self.files]
+        
+        # Fall back to keyword search
+        return self.find_relevant(symbol, top_n=10)
+
+    def find_tests(self, symbol: str) -> list[FileEntry]:
+        """Find test files related to a symbol.
+        
+        Looks for files with 'test' in the path or filename.
+        """
+        results = self.find_references(symbol)
+        test_files = [f for f in results if "test" in f.path.lower() or "_test" in f.path]
+        
+        # Also scan for test files in test directories
+        for path in self.project_path.rglob("*test*.py"):
+            rel = str(path.relative_to(self.project_path))
+            if rel in self.files:
+                test_files.append(self.files[rel])
+        
+        return test_files
 
     def get_context(self, files: list[FileEntry], max_chars: int = 8000) -> str:
         """Build context string from file list."""

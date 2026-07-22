@@ -232,8 +232,8 @@ object**:
 
 | Action | Scope | Notes |
 |--------|-------|-------|
-| `list` | whole vault | shallow map auto-injected each turn |
-| `read` | whole vault | binary/non-UTF8 files fail informatively |
+| `list` | current project | shallow map auto-injected each turn |
+| `read` | current project | binary/non-UTF8 files fail informatively; truncated at 3000 chars |
 | `write` | current project only | full-file replace; backed up first |
 | `execute` | current project's cwd | sandboxed, opt-in |
 | `ask_human` | — | parks task in `tasks/waiting/` |
@@ -299,11 +299,14 @@ Current coverage:
 ## Explicit Non-Goals
 
 - Multi-instance coordination beyond crash recovery
-- True sandboxing / containerized execution
 - Git-native workflow (branch-per-task, auto-PR)
 - A lint/typecheck/test/security verification pipeline assuming a full installed toolchain
-- A task scheduler with priority/dependency graphs and parallel workers (see simplified branch)
 - A web dashboard
+
+Note: The `lean/` branch intentionally diverges from some non-goals above:
+- It implements a task scheduler with DAG-based priority/dependency graphs and parallel workers
+- It implements sandboxed execution (with opt-in flag)
+- These are documented features of the lean/ implementation
 
 ---
 
@@ -315,6 +318,7 @@ Before saying a change is done:
 2. Does a self-test exist that would fail if this regressed? If not, add one.
 3. Run the self-test suite. All of it.
 4. If extending scope, check against Non-Goals first.
+5. **SPEC/code reconciliation check**: No sentence in SPEC.md should be contradicted by a grep through `lean/*.py`. Run `grep -n "your claim" lean/*.py` to verify before claiming compliance.
 
 ---
 

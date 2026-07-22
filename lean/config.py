@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "execute_timeout": 30,
     "stale_claim_minutes": 30,
     "task_timeout_seconds": 300,  # 5 minutes default task timeout
+    "allow_execute": False,  # Execute action is opt-in, off by default
     "workers": [
         {
             "name": "default",

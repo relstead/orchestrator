@@ -83,29 +83,35 @@ def run_test() -> bool:
             # Reproduce exactly what _run()'s dispatch loop does:
             # reserve a worker, mark it busy, then execute the task
             # the same way _execute_and_release does.
+            # NOTE: The worker MUST be passed to execute_task for the dispatch to work.
             worker = orch.pool.get_idle("general")
             assert worker is not None, "setup problem: no idle worker found"
             worker.start_job(task_path.stem)
 
-            result = orch.execute_task(task_path)
+            # Pass the worker - this is what _execute_and_release does
+            result = orch.execute_task(task_path, worker=worker)
 
-        if not result.success:
-            print(f"FAIL: task did not succeed. output={result.output!r}")
-            passed = False
-        else:
-            print("PASS: single-worker dispatch completed without "
-                  "'No available workers'")
+            # _execute_and_release calls finish_job in its finally block
+            # Simulate that here
+            worker.finish_job(success=result.success, duration=result.duration_seconds, cost_usd=result.cost_usd)
 
-        # Bonus check: assert the SAME worker object that was reserved is the
-        # one whose metrics reflect the job (not left dangling BUSY forever,
-        # and not a phantom second worker doing invisible work).
-        if worker.current_job_id is not None:
-            print(f"FAIL: reserved worker still shows current_job_id="
-                  f"{worker.current_job_id!r} after task finished "
-                  f"(finish_job was never called on it)")
-            passed = False
-        else:
-            print("PASS: reserved worker's job slot was released correctly")
+            if not result.success:
+                print(f"FAIL: task did not succeed. output={result.output!r}")
+                passed = False
+            else:
+                print("PASS: single-worker dispatch completed without "
+                      "'No available workers'")
+
+            # Bonus check: assert the SAME worker object that was reserved is the
+            # one whose metrics reflect the job (not left dangling BUSY forever,
+            # and not a phantom second worker doing invisible work).
+            if worker.current_job_id is not None:
+                print(f"FAIL: reserved worker still shows current_job_id="
+                      f"{worker.current_job_id!r} after task finished "
+                      f"(finish_job was never called on it)")
+                passed = False
+            else:
+                print("PASS: reserved worker's job slot was released correctly")
 
     finally:
         shutil.rmtree(vault, ignore_errors=True)

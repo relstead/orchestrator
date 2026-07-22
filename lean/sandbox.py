@@ -12,6 +12,7 @@ Network access is disabled by default.
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,73 +44,12 @@ def is_dangerous(command: str) -> bool:
     return DANGEROUS_RE.search(command) is not None
 
 
-def _get_sandbox_cmd(
-    project_path: Path,
-    allow_network: bool = False,
-) -> list[str] | None:
-    """
-    Get sandbox wrapper command for the platform.
-    
-    Returns command prefix (list) or None if no sandbox available.
-    """
-    # Try bubblewrap first
+def _check_bubblewrap() -> bool:
+    """Check if bubblewrap is available."""
     bubblewrap_path = subprocess.run(
         ["which", "bwrap"], capture_output=True, text=True
     ).stdout.strip()
-    
-    if bubblewrap_path and os.path.exists(bubblewrap_path):
-        cmd = [
-            bubblewrap_path,
-            "--unshare-user",          # New user namespace
-            "--unshare-pid",          # New PID namespace
-            "--unshare-uts",          # New UTS namespace (hostname)
-            "--unshare-ipc",          # New IPC namespace
-            "--die-with-parent",      # Kill child if parent dies
-            "--clear-env",            # Clear all env vars
-        ]
-        
-        if not allow_network:
-            cmd.append("--unshare-net")  # No network access
-        
-        # Filesystem isolation: only project dir visible
-        cmd.extend([
-            "--tmpfs", "/tmp",
-            "--dev", "/dev",
-            "--proc", "/proc",
-            "--ro-bind", str(project_path.resolve()), str(project_path.resolve()),
-        ])
-        
-        # Add only safe environment variables
-        cmd.extend([
-            "env",
-            "-i",
-            f"HOME={project_path}",
-            f"TMPDIR=/tmp",
-            "PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        ])
-        
-        return cmd
-    
-    # Fallback to unshare-based sandbox
-    unshare_path = subprocess.run(
-        ["which", "unshare"], capture_output=True, text=True
-    ).stdout.strip()
-    
-    if unshare_path and os.path.exists(unshare_path):
-        # unshare can't do filesystem isolation alone, but provides namespace isolation
-        # We combine it with a chroot-like approach using pivot_root or bind mounts
-        cmd = [
-            unshare_path,
-            "--mount",
-            "--pid",
-            "--ipc",
-            "--uts",
-        ]
-        if not allow_network:
-            cmd.append("--net")
-        return cmd
-    
-    return None
+    return bool(bubblewrap_path and os.path.exists(bubblewrap_path))
 
 
 def execute(
@@ -123,7 +63,7 @@ def execute(
     Execute command in sandboxed environment.
     
     Security features:
-    - Filesystem view limited to project directory
+    - Filesystem view limited to project directory (with bubblewrap)
     - Network disabled by default (allow_network=True to enable)
     - Environment variables cleared except safe allowlist
     - Process/mount/IPC/UTS namespaces isolated
@@ -136,69 +76,27 @@ def execute(
     
     project_path = cwd.resolve()
     
+    # Safe environment - never passes secrets to subprocess
+    safe_env = {
+        "HOME": str(project_path),
+        "TMPDIR": "/tmp",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    
     try:
-        # Check for sandbox availability
-        sandbox_cmd = _get_sandbox_cmd(project_path, allow_network)
-        
-        if sandbox_cmd:
-            # Use sandboxed execution
-            # Build the full command - shell wrapper to set up environment
-            env_script = f"""
-                cd "{project_path}"
-                {command}
-            """
-            
-            # Build environment with only safe variables
-            safe_env = {
-                "HOME": str(project_path),
-                "TMPDIR": "/tmp",
-                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            }
-            
-            result = subprocess.run(
-                ["sh", "-c", env_script],
-                cwd=str(project_path),
-                env=safe_env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        else:
-            # No sandbox available - use basic isolation
-            # Clear environment to prevent API key leakage
-            safe_env = {
-                "HOME": str(project_path),
-                "TMPDIR": "/tmp",
-                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            }
-            
-            # Use chroot-like isolation by running in project dir
-            # This is not as secure but provides some isolation
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(project_path),
-                env=safe_env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+        # Try bubblewrap first (best containment)
+        if _check_bubblewrap():
+            return _execute_with_bubblewrap(
+                command, project_path, timeout, max_output, allow_network, safe_env
             )
         
-        output = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
-        output = output.strip() or "(no output)"
-        
-        if len(output) > max_output:
-            output = output[:max_output] + f"\n...[{len(output) - max_output} more chars]"
-        
-        return ExecutionResult(
-            success=result.returncode == 0,
-            exit_code=result.returncode,
-            output=output,
-            timed_out=False,
+        # Fallback: basic isolation (limited without root/bubblewrap)
+        # We can't fully restrict filesystem access without a proper sandbox,
+        # but we prevent API key leakage by clearing the environment
+        return _execute_basic_isolation(
+            command, project_path, timeout, max_output, safe_env
         )
     
     except subprocess.TimeoutExpired:
@@ -206,3 +104,164 @@ def execute(
     
     except Exception as e:
         return ExecutionResult(success=False, exit_code=-1, output=f"ERROR: {e}", timed_out=False)
+
+
+def _execute_with_bubblewrap(
+    command: str,
+    project_path: Path,
+    timeout: int,
+    max_output: int,
+    allow_network: bool,
+    safe_env: dict[str, str],
+) -> ExecutionResult:
+    """Execute using bubblewrap for proper isolation."""
+    project_str = str(project_path.resolve())
+    
+    # Build bubblewrap command for filesystem containment
+    bwrap_cmd = [
+        "bwrap",
+        "--unshare-user",          # New user namespace
+        "--unshare-pid",          # New PID namespace  
+        "--unshare-uts",          # New UTS namespace (hostname)
+        "--unshare-ipc",          # New IPC namespace
+        "--die-with-parent",      # Kill child if parent dies
+        "--clear-env",            # Clear all env vars
+    ]
+    
+    if not allow_network:
+        bwrap_cmd.append("--unshare-net")  # No network access
+    
+    # Filesystem isolation: create a minimal view
+    # /tmp is a tmpfs
+    # /dev is minimal
+    # /proc is mounted
+    # Only the project directory is accessible (bind-mounted read-only)
+    bwrap_cmd.extend([
+        "--tmpfs", "/tmp",
+        "--dev", "/dev/null",
+        "--proc", "/proc",
+        "--ro-bind", project_str, project_str,
+    ])
+    
+    # Add only safe environment variables
+    for key, value in safe_env.items():
+        bwrap_cmd.extend(["--setenv", key, value])
+    
+    # The command to run
+    bwrap_cmd.extend(["sh", "-c", f"cd '{project_str}' && {command}"])
+    
+    result = subprocess.run(
+        bwrap_cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    
+    output = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
+    output = output.strip() or "(no output)"
+    
+    if len(output) > max_output:
+        output = output[:max_output] + f"\n...[{len(output) - max_output} more chars]"
+    
+    return ExecutionResult(
+        success=result.returncode == 0,
+        exit_code=result.returncode,
+        output=output,
+        timed_out=False,
+    )
+
+
+def _execute_basic_isolation(
+    command: str,
+    project_path: Path,
+    timeout: int,
+    max_output: int,
+    safe_env: dict[str, str],
+) -> ExecutionResult:
+    """
+    Basic isolation without bubblewrap.
+    
+    Note: This cannot fully restrict filesystem access without proper sandboxing
+    tools (bubblewrap, firejail, etc.) or root privileges. It primarily prevents
+    API key leakage by clearing environment variables.
+    
+    For production use, install bubblewrap: apt install bubblewrap
+    """
+    # Check if we can use unshare for basic namespace isolation
+    unshare_available = subprocess.run(
+        ["which", "unshare"], capture_output=True, text=True
+    ).stdout.strip() and os.path.exists(
+        subprocess.run(["which", "unshare"], capture_output=True, text=True).stdout.strip()
+    )
+    
+    if unshare_available:
+        unshare_path = subprocess.run(
+            ["which", "unshare"], capture_output=True, text=True
+        ).stdout.strip()
+        
+        # Try to create a private mount namespace with a restricted view
+        # This requires CAP_SYS_ADMIN (usually available in containers)
+        try:
+            # Create a temporary directory that will become our new root
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Create a minimal root structure
+                rootfs = Path(tmpdir) / "rootfs"
+                rootfs.mkdir()
+                (rootfs / "project").mkdir()
+                
+                # Try to use pivot_root for proper containment
+                # This is complex and may fail without proper privileges
+                script = f"""
+                    mount --bind {project_path} {rootfs / "project"} 2>/dev/null || true
+                    cd {rootfs / "project"}
+                    {command}
+                """
+                
+                # Try unshare with mount namespace
+                result = subprocess.run(
+                    [unshare_path, "--mount", "--pid", "--fork"],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=safe_env,
+                )
+                
+                output = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
+                output = output.strip() or "(no output)"
+                
+                if len(output) > max_output:
+                    output = output[:max_output] + f"\n...[{len(output) - max_output} more chars]"
+                
+                return ExecutionResult(
+                    success=result.returncode == 0,
+                    exit_code=result.returncode,
+                    output=output,
+                    timed_out=False,
+                )
+        except Exception:
+            pass  # Fall through to basic execution
+    
+    # Basic execution with cleared environment (no true filesystem containment)
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=str(project_path),
+        env=safe_env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    
+    output = (result.stdout or "") + (("\n[stderr]\n" + result.stderr) if result.stderr else "")
+    output = output.strip() or "(no output)"
+    
+    if len(output) > max_output:
+        output = output[:max_output] + f"\n...[{len(output) - max_output} more chars]"
+    
+    return ExecutionResult(
+        success=result.returncode == 0,
+        exit_code=result.returncode,
+        output=output,
+        timed_out=False,
+    )

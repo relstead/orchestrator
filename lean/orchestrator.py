@@ -119,6 +119,11 @@ class Orchestrator:
         """
         Process _inbox.md entries and convert them to tasks.
         
+        Inbox format supports inline project targeting:
+        - "Fix the bug" → uses active project (from _active.md or default)
+        - "[project-name] Fix the bug" → uses specified project
+        - "@project-name: Fix the bug" → uses specified project (alt syntax)
+        
         Scans inbox for new lines, creates task files, archives processed content.
         Returns number of tasks created.
         """
@@ -147,25 +152,45 @@ class Orchestrator:
                 new_lines.append(line)
                 continue
             
-            # Skip lines that look like they're already task descriptions (too short or too long)
-            if len(stripped) < 10 or len(stripped) > 500:
+            # Parse inline project targeting: "[project] task" or "@project: task"
+            project = active_project
+            task_body = stripped
+            
+            # Check for [project] syntax
+            import re
+            bracket_match = re.match(r'^\[([^\]]+)\]\s*(.+)$', stripped)
+            if bracket_match:
+                project = bracket_match.group(1).strip()
+                task_body = bracket_match.group(2).strip()
+            else:
+                # Check for @project: syntax
+                at_match = re.match(r'^@([^\s:]+):\s*(.+)$', stripped)
+                if at_match:
+                    project = at_match.group(1).strip()
+                    task_body = at_match.group(2).strip()
+            
+            # Skip lines that are too short or too long
+            if len(task_body) < 10 or len(task_body) > 500:
                 new_lines.append(line)
                 continue
             
             # This is a task entry - create it
             try:
-                task_path = new_task_file(
-                    self.vault_root / "Projects" / active_project,
-                    "general",
-                    stripped,
-                )
-                tasks_created += 1
-                self.log(f"Inbox: created task from '{stripped[:50]}...'")
+                project_path = self.vault_root / "Projects" / project
                 
-                # Archive this line with timestamp
+                # Ensure project exists (auto-create if needed)
+                if not project_path.exists():
+                    ensure_project_skeleton(self.vault_root, project)
+                    self._update_digest(f"Auto-created project: {project}", "info")
+                
+                task_path = new_task_file(project_path, "general", task_body)
+                tasks_created += 1
+                self.log(f"Inbox: created task in [{project}]: '{task_body[:50]}...'")
+                
+                # Archive this line with timestamp and project
                 timestamp = datetime.now().isoformat()
                 archive_path.write_text(
-                    f"\n[{timestamp}] {stripped}",
+                    f"\n[{timestamp}] [{project}] {task_body}",
                     encoding="utf-8",
                 )
             except Exception as e:

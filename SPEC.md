@@ -82,13 +82,29 @@ The orchestrator will:
 ### 5. Add Tasks (No AI Required)
 
 **Option A: Add via inbox (auto-converted to tasks)**
+
+The inbox supports inline project targeting with two syntaxes:
+
 ```markdown
 # In _inbox.md
-Fix the login bug
-Add dark mode support
-Update documentation
+
+[project-name] Fix the login bug that rejects credentials
+@another-project: Add dark mode support for iOS
+Fix this in the active project (uses _active.md)
 ```
-Tasks are automatically created in the active project and the inbox content is archived.
+
+**Syntax options:**
+| Format | Example | Project |
+|--------|---------|---------|
+| `[project-name] task` | `[web-app] Fix login` | web-app |
+| `@project-name: task` | `@mobile-app: Add dark mode` | mobile-app |
+| `plain task` | `Fix this bug` | active project (from `_active.md`) |
+
+**Features:**
+- Tasks are auto-created in the correct project folder
+- Projects are auto-created if they don't exist
+- Processed items are archived with timestamp and project
+- Header lines (starting with `#`) are ignored
 
 **Option B: Add via `lean add` CLI**
 ```bash

@@ -316,11 +316,12 @@ class Orchestrator:
             # Get ready tasks
             ready = graph.get_ready()
             
-            # Get idle worker
-            worker = self.pool.get_idle()
-            
-            if ready and worker:
-                task_node = ready[0]
+            # Dispatch ready tasks to idle workers (parallel execution)
+            for task_node in ready:
+                worker = self.pool.get_idle()
+                if not worker:
+                    break  # No more idle workers available
+                
                 worker.start_job(task_node.id)
                 
                 # Execute in background
@@ -335,6 +336,6 @@ class Orchestrator:
     def _execute_and_release(self, task_path: Path, worker) -> None:
         """Execute task and release worker."""
         try:
-            self.execute_task(task_path)
+            result = self.execute_task(task_path)
         finally:
-            worker.finish_job(success=True)  # Result tracked in metrics
+            worker.finish_job(success=result.success)

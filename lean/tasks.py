@@ -109,34 +109,22 @@ def finish_task(task_path: Path, success: bool, result: str = "") -> None:
 
 def scan_pending_tasks(vault_root: Path) -> list[Path]:
     """Scan all pending tasks across all projects."""
-    pending = vault_root / "pending"
-    if not pending.exists():
-        return []
-    
-    tasks = []
-    for project_dir in pending.iterdir():
-        if not project_dir.is_dir():
-            continue
-        tasks_dir = project_dir / "tasks" / "pending"
-        if tasks_dir.exists():
-            tasks.extend(tasks_dir.glob("*.md"))
-    return tasks
+    # Tasks are stored in vault_root/Projects/<project>/tasks/pending/
+    # Also check legacy vault_root/pending/ for backward compatibility
+    return [
+        p for p in vault_root.rglob("**/pending/*.md")
+        if "/_backups/" not in str(p)  # Exclude backup files
+    ]
 
 
 def scan_doing_tasks(vault_root: Path) -> list[Path]:
     """Scan all tasks currently being worked on."""
-    doing = vault_root / "doing"
-    if not doing.exists():
-        return []
-    
-    tasks = []
-    for project_dir in doing.iterdir():
-        if not project_dir.is_dir():
-            continue
-        tasks_dir = project_dir / "tasks" / "doing"
-        if tasks_dir.exists():
-            tasks.extend(tasks_dir.glob("*.md"))
-    return tasks
+    # Tasks are stored in vault_root/Projects/<project>/tasks/doing/
+    # Also check legacy vault_root/doing/ for backward compatibility
+    return [
+        p for p in vault_root.rglob("**/doing/*.md")
+        if "/_backups/" not in str(p)  # Exclude backup files
+    ]
 
 
 def is_stale(task_path: Path, instance_id: str, max_age_minutes: int) -> bool:

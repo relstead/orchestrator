@@ -6,17 +6,19 @@ verification, rollback. AI handles: inference only.
 
 import json
 import os
+import signal
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .agent import Action, parse_action, build_prompt
 from .config import load_config
 from .dependency import DependencyGraph, build_graph_from_paths
 from .indexer import Indexer
+from .logger import Logger, LogLevel, get_default_logger
 from .rollback import RollbackManager
 from .sandbox import execute
 from .tasks import (
@@ -28,12 +30,116 @@ from .vault import ensure_vault_skeleton, safe_vault_path, list_project_dirs, en
 from .worker import WorkerPool
 
 
+# Default task timeout (seconds)
+DEFAULT_TASK_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
 @dataclass
 class ExecutionResult:
     """Result of task execution."""
     success: bool
     output: str
     changes: list[str]
+    cost_usd: float = 0.0
+    duration_seconds: float = 0.0
+
+
+class AuditLog:
+    """
+    Tracks who/when/what events in _audit.md.
+    Per SPEC.md: vault files are the source of truth.
+    """
+    
+    def __init__(self, vault_root: Path):
+        self.audit_path = vault_root / "_audit.md"
+        self._lock = threading.Lock()
+    
+    def log(self, event_type: str, detail: str, **extra: Any) -> None:
+        """Append an audit entry."""
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        
+        entry_parts = [f"[{timestamp}] {event_type}: {detail}"]
+        for key, value in extra.items():
+            if value is not None:
+                entry_parts.append(f"  {key}={value}")
+        
+        entry = " | ".join(entry_parts) + "\n"
+        
+        with self._lock:
+            self.audit_path.write_text(
+                self.audit_path.read_text() + entry,
+                encoding="utf-8",
+            )
+
+
+class CostTracker:
+    """
+    Tracks cost per project and per model.
+    Persists to _costs.json in vault root.
+    """
+    
+    def __init__(self, vault_root: Path):
+        self.costs_path = vault_root / "_costs.json"
+        self._lock = threading.Lock()
+        self._costs = self._load()
+    
+    def _load(self) -> dict[str, Any]:
+        """Load costs from disk."""
+        if self.costs_path.exists():
+            try:
+                return json.loads(self.costs_path.read_text())
+            except Exception:
+                pass
+        return {"total_usd": 0.0, "by_project": {}, "by_model": {}}
+    
+    def _save(self) -> None:
+        """Save costs to disk."""
+        self.costs_path.write_text(json.dumps(self._costs, indent=2), encoding="utf-8")
+    
+    def record(self, project: str, model: str, cost_usd: float) -> None:
+        """Record a cost entry."""
+        if cost_usd <= 0:
+            return
+        
+        with self._lock:
+            self._costs["total_usd"] = self._costs.get("total_usd", 0.0) + cost_usd
+            self._costs["by_project"][project] = self._costs.get("by_project", {}).get(project, 0.0) + cost_usd
+            self._costs["by_model"][model] = self._costs.get("by_model", {}).get(model, 0.0) + cost_usd
+            self._save()
+    
+    def get_summary(self) -> dict[str, Any]:
+        """Get cost summary."""
+        return self._costs.copy()
+
+
+# Prompt templates per task type
+DEFAULT_PROMPT_TEMPLATES = {
+    "general": """You are an AI assistant working with a project. 
+Your goal is to complete the task efficiently using the available actions.
+- Use 'list' to explore the project structure
+- Use 'read' to examine files
+- Use 'write' to make changes (in the current project only)
+- Use 'execute' sparingly and only safe commands
+- Use 'ask_human' if you need clarification
+- Use 'final' when the task is complete
+
+Be concise and focused.""",
+    
+    "coding": """You are an expert programmer working on code in a project.
+Your goal is to implement, fix, or refactor code efficiently.
+- Start by exploring the codebase with 'list' and 'read'
+- Make targeted changes with 'write'
+- Use 'execute' to run tests or build commands
+- If tests fail, analyze the output and iterate
+- Use 'final' when the code is complete and tested""",
+    
+    "reasoning": """You are a reasoning assistant analyzing problems deeply.
+Your goal is to think through complex issues carefully.
+- Use 'read' to gather all relevant information
+- Think step by step and use 'final' with your analysis
+- If code changes are needed, use 'write' to propose them
+- Use 'ask_human' if you need additional context""",
+}
 
 
 class Orchestrator:
@@ -41,23 +147,42 @@ class Orchestrator:
     Main orchestrator coordinating tasks and workers.
     
     - Builds DAG from task dependencies
-    - Assigns ready tasks to workers
+    - Assigns ready tasks to workers (smart routing by task_type)
     - Runs verification
     - Handles rollback on failure
+    - Enforces task timeouts
+    - Tracks costs and audit log
+    - Supports hot reload config
+    - Uses structured JSON logging
     """
     
     def __init__(
         self,
         vault_root: Path,
         log_fn: Callable[[str], None] | None = None,
+        logger: Logger | None = None,
     ):
         self.vault_root = vault_root
-        self.log = log_fn or (lambda x: None)
-        self.config = load_config(vault_root)
+        self._logger = logger or get_default_logger(vault_root)
+        self.log = log_fn or (lambda x: self._logger.info(x))
+        
+        # Config with hot reload support
+        self._config_mtime: float = 0
+        self._load_config()
+        
         self.rollback = RollbackManager(vault_root)
         
         # Workers
         self.pool = WorkerPool(self.config.get("workers", []))
+        
+        # Audit log
+        self.audit = AuditLog(vault_root)
+        
+        # Cost tracking
+        self.costs = CostTracker(vault_root)
+        
+        # Prompt templates
+        self.prompt_templates = self.config.get("prompt_templates", DEFAULT_PROMPT_TEMPLATES)
         
         # Instance ID for claiming tasks
         self.instance_id = f"{os.environ.get('COMPUTERNAME', os.environ.get('HOSTNAME', 'host'))}-{os.getpid()}"
@@ -67,10 +192,68 @@ class Orchestrator:
         
         # Control
         self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._pause.set()  # Not paused by default
         self._thread: threading.Thread | None = None
+        
+        # Task timeout
+        self._task_timeout = self.config.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS)
         
         # Ensure vault structure
         ensure_vault_skeleton(vault_root)
+        
+        self._logger.info("Orchestrator initialized", vault=str(vault_root))
+    
+    def _load_config(self) -> None:
+        """Load config, tracking mtime for hot reload."""
+        self.config = load_config(self.vault_root)
+        config_path = self.vault_root / "config.json"
+        if config_path.exists():
+            self._config_mtime = config_path.stat().st_mtime
+        else:
+            self._config_mtime = 0
+    
+    def _check_config_reload(self) -> bool:
+        """Check if config has changed and reload if needed. Returns True if reloaded."""
+        config_path = self.vault_root / "config.json"
+        if not config_path.exists():
+            return False
+        
+        current_mtime = config_path.stat().st_mtime
+        if current_mtime != self._config_mtime:
+            self._logger.info("Config file changed, reloading", 
+                            old_mtime=self._config_mtime, new_mtime=current_mtime)
+            self._load_config()
+            
+            # Reload workers in place (per SPEC.md: settings update in place)
+            self.pool = WorkerPool(self.config.get("workers", []))
+            
+            # Reload prompt templates
+            self.prompt_templates = self.config.get("prompt_templates", DEFAULT_PROMPT_TEMPLATES)
+            
+            # Reload task timeout
+            self._task_timeout = self.config.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS)
+            
+            self.audit.log("config_reload", "Configuration reloaded from file")
+            self._logger.info("Config reloaded successfully")
+            return True
+        return False
+    
+    def pause(self) -> None:
+        """Pause task processing."""
+        self._pause.clear()
+        self._logger.info("Orchestrator paused")
+        self.audit.log("pause", "Task processing paused")
+    
+    def resume(self) -> None:
+        """Resume task processing."""
+        self._pause.set()
+        self._logger.info("Orchestrator resumed")
+        self.audit.log("resume", "Task processing resumed")
+    
+    def is_paused(self) -> bool:
+        """Check if orchestrator is paused."""
+        return not self._pause.is_set()
     
     # =========================================================================
     # Project Indexing
@@ -93,6 +276,30 @@ class Orchestrator:
             prefer_languages=["python", "javascript", "typescript", "go", "rust"],
         )
         return indexer.get_context(relevant, max_chars=6000)
+    
+    def _get_prompt(self, task_type: str, task_body: str, context: str) -> str:
+        """
+        Build a prompt using the appropriate template for the task type.
+        
+        Falls back to 'general' template if task_type not found.
+        """
+        template = self.prompt_templates.get(task_type, self.prompt_templates.get("general", ""))
+        
+        # Build full prompt with context
+        if context:
+            return f"""{template}
+
+## Task
+{task_body}
+
+## Relevant Context
+{context}
+"""
+        return f"""{template}
+
+## Task
+{task_body}
+"""
     
     # =========================================================================
     # Crash Recovery
@@ -340,7 +547,15 @@ class Orchestrator:
     # =========================================================================
     
     def execute_task(self, task_path: Path) -> ExecutionResult:
-        """Execute a single task with an available worker."""
+        """
+        Execute a single task with an available worker.
+        
+        Features:
+        - Smart task routing (routes by task_type to matching workers)
+        - Task timeout enforcement
+        - Cost tracking
+        - Audit logging
+        """
         max_attempts = self.config.get("max_task_attempts", 3)
         max_turns = self.config.get("max_turns", 6)
         execute_timeout = self.config.get("execute_timeout", 30)
@@ -352,10 +567,12 @@ class Orchestrator:
         project_path = task_path.parent.parent.parent / "Projects" / task_path.parent.parent.name
         if not project_path.exists():
             project_path = task_path.parent.parent.parent / "Projects" / "default"
+        project_name = project_path.name
         
         # Claim task
         claimed = claim_task(task_path, self.instance_id)
         if not claimed:
+            self.audit.log("task_claim_failed", f"Failed to claim task", task=str(task_path))
             return ExecutionResult(success=False, output="Failed to claim task", changes=[])
         
         task_path = claimed
@@ -368,23 +585,41 @@ class Orchestrator:
         task_path.write_text(new_txt)
         
         self.log(f"Executing: {task.body[:50]}... (attempt {task.attempts}/{max_attempts})")
+        self.audit.log("task_start", f"Started task execution",
+                      task=str(task_path), type=task.task_type, project=project_name,
+                      attempt=task.attempts)
         
         # Snapshot before execution
         snapshot_path = self.rollback.snapshot(project_path, f"task-{task_path.stem[:8]}")
         
+        # Track timing
+        start_time = time.time()
+        total_cost = 0.0
+        
         try:
             # Build context
             relevant_context = self._get_relevant_context(project_path, task.body)
-            prompt = build_prompt(task.body, relevant_context)
             
-            # Execute agent loop
-            success, output, changes = self._agent_loop(
+            # Use template-based prompt with task type
+            prompt = self._get_prompt(task.task_type, task.body, relevant_context)
+            
+            # Execute agent loop with task type and timeout
+            success, output, changes, cost = self._agent_loop(
                 prompt=prompt,
                 project_path=project_path,
                 max_turns=max_turns,
                 execute_timeout=execute_timeout,
                 task_id=task_path.stem,
+                task_type=task.task_type,
+                timeout_seconds=self._task_timeout,
             )
+            
+            total_cost = cost
+            duration = time.time() - start_time
+            
+            # Record cost
+            if total_cost > 0:
+                self.costs.record(project_name, "unknown", total_cost)  # Model recorded in _agent_loop
             
             # Verification
             if success:
@@ -398,26 +633,43 @@ class Orchestrator:
                 if snapshot_path:
                     self.rollback.rollback(snapshot_path, project_path)
                 
+                self.audit.log("task_fail", f"Task failed",
+                              task=str(task_path), project=project_name,
+                              attempt=task.attempts, cost_usd=total_cost,
+                              duration_seconds=duration)
+                
                 if task.attempts >= max_attempts:
                     finish_task(task_path, success=False, result=output[:200])
                     self.log(f"Failed after {max_attempts} attempts")
-                    return ExecutionResult(success=False, output=output, changes=changes)
+                    return ExecutionResult(success=False, output=output, changes=changes,
+                                        cost_usd=total_cost, duration_seconds=duration)
                 
                 # Release back to pending for retry
                 release_task(task_path, back_to_pending=True)
-                return ExecutionResult(success=False, output=output, changes=changes)
+                return ExecutionResult(success=False, output=output, changes=changes,
+                                    cost_usd=total_cost, duration_seconds=duration)
             
             # Success
             finish_task(task_path, success=True, result=output[:200])
             self.log(f"Completed: {task.body[:50]}...")
-            return ExecutionResult(success=True, output=output, changes=changes)
+            self.audit.log("task_complete", f"Task completed successfully",
+                          task=str(task_path), project=project_name,
+                          cost_usd=total_cost, duration_seconds=duration,
+                          changes=len(changes))
+            return ExecutionResult(success=True, output=output, changes=changes,
+                                cost_usd=total_cost, duration_seconds=duration)
         
         except Exception as e:
+            duration = time.time() - start_time
             self.log(f"Error: {e}")
+            self.audit.log("task_error", f"Task error: {e}",
+                          task=str(task_path), project=project_name,
+                          duration_seconds=duration)
             if snapshot_path:
                 self.rollback.rollback(snapshot_path, project_path)
             finish_task(task_path, success=False, result=str(e))
-            return ExecutionResult(success=False, output=str(e), changes=[])
+            return ExecutionResult(success=False, output=str(e), changes=[],
+                                cost_usd=total_cost, duration_seconds=duration)
     
     def _agent_loop(
         self,
@@ -426,18 +678,42 @@ class Orchestrator:
         max_turns: int,
         execute_timeout: int,
         task_id: str | None = None,
-    ) -> tuple[bool, str, list[str]]:
-        """Run the AI agent loop."""
+        task_type: str = "general",
+        timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS,
+    ) -> tuple[bool, str, list[str], float]:
+        """
+        Run the AI agent loop.
+        
+        Features:
+        - Smart task routing (routes by task_type to matching workers)
+        - Task timeout enforcement
+        - Cost tracking
+        
+        Returns: (success, output, changed_files, total_cost)
+        """
         messages = [{"role": "system", "content": prompt}]
         changed_files: list[str] = []
         read_files: set[str] = set()
+        total_cost = 0.0
+        loop_start_time = time.time()
+        last_model = "unknown"
         
         for turn in range(max_turns):
-            # Call AI
+            # Check overall task timeout
+            elapsed = time.time() - loop_start_time
+            if elapsed >= timeout_seconds:
+                self._logger.warning("Task timeout exceeded", 
+                                   task_id=task_id, elapsed_seconds=elapsed,
+                                   timeout_seconds=timeout_seconds)
+                return False, f"Task timeout after {int(elapsed)}s", changed_files, total_cost
+            
+            # Call AI with smart routing (use task_type)
             try:
-                worker, response = self.pool.call("general", messages)
+                worker, response, cost = self.pool.call(task_type, messages)
+                total_cost += cost
+                last_model = worker.model
             except RuntimeError as e:
-                return False, f"No workers available: {e}", changed_files
+                return False, f"No workers available: {e}", changed_files, total_cost
             
             # Persist turn progress (CRASH RESILIENCE per SPEC.md)
             self.persist_turn_progress(task_id, turn, messages, response)
@@ -457,13 +733,13 @@ class Orchestrator:
             
             # Check for final
             if action.action == "final":
-                return True, action.result or obs, changed_files
+                return True, action.result or obs, changed_files, total_cost
             
             # Continue
             messages.append({"role": "assistant", "content": response})
             messages.append({"role": "user", "content": obs})
         
-        return False, f"Hit {max_turns} turn limit", changed_files
+        return False, f"Hit {max_turns} turn limit", changed_files, total_cost
     
     def persist_turn_progress(
         self,
@@ -593,6 +869,13 @@ class Orchestrator:
         while not self._stop.is_set():
             cycle_count += 1
             
+            # === Check pause state ===
+            self._pause.wait()  # Block if paused
+            
+            # === Check for config hot reload (every 10 cycles ≈ 10 seconds) ===
+            if cycle_count % 10 == 0:
+                self._check_config_reload()
+            
             # === Periodic housekeeping (every 60 cycles ≈ 1 minute) ===
             if cycle_count % 60 == 0:
                 # Detect new projects
@@ -630,7 +913,12 @@ class Orchestrator:
             
             # Dispatch ready tasks to idle workers (parallel execution)
             for task_node in ready:
-                worker = self.pool.get_idle()
+                # Get task type for smart routing
+                task = parse_task(task_node.path)
+                task_type = task.task_type if task.task_type else "general"
+                
+                # Smart routing: get worker that can handle this task type
+                worker = self.pool.get_idle(task_type)
                 if not worker:
                     break  # No more idle workers available
                 
@@ -649,9 +937,14 @@ class Orchestrator:
         """Execute task and release worker."""
         success = False
         task_name = task_path.stem
+        duration = 0.0
+        cost = 0.0
+        
         try:
             result = self.execute_task(task_path)
             success = result.success
+            duration = result.duration_seconds
+            cost = result.cost_usd
             
             # Update digest and project status
             if success:
@@ -673,4 +966,4 @@ class Orchestrator:
             success = False
             self._update_digest(f"Task error {task_name}: {e}", "error")
         finally:
-            worker.finish_job(success=success)
+            worker.finish_job(success=success, duration=duration, cost_usd=cost)

@@ -366,6 +366,16 @@ Key decisions:
 | Auto-project detection | ✅ | `orchestrator.py: _detect_new_projects()` |
 | Digest generation | ✅ | `orchestrator.py: _update_digest()` |
 | STATUS.md management | ✅ | `orchestrator.py: _update_project_status()` |
+| Structured JSON logging | ✅ | `logger.py` |
+| Circuit breaker | ✅ | `worker.py: record_failure()` |
+| Task timeout | ✅ | `orchestrator.py: _agent_loop()` |
+| Hot reload config | ✅ | `orchestrator.py: _check_config_reload()` |
+| Smart task routing | ✅ | `worker.py: is_available()` + `orchestrator.py: _run()` |
+| Cost tracking | ✅ | `orchestrator.py: CostTracker` |
+| Audit log (_audit.md) | ✅ | `orchestrator.py: AuditLog` |
+| Prompt templates | ✅ | `orchestrator.py: DEFAULT_PROMPT_TEMPLATES` |
+| Secret management (env vars) | ✅ | `config.py: _resolve_env_vars()` |
+| CLI enhancements (logs, task, pause) | ✅ | `cli.py` |
 
 ### 🔄 Planned (Not Yet Implemented)
 

@@ -88,7 +88,7 @@ Fix the login bug
 Add dark mode support
 Update documentation
 ```
-*Note: Inbox processing is planned but not yet implemented.*
+Tasks are automatically created in the active project and the inbox content is archived.
 
 **Option B: Add via `lean add` CLI**
 ```bash
@@ -125,7 +125,7 @@ Projects/new-project/
     waiting/
 ```
 
-*Note: Auto-detection is planned but not yet implemented. Use `lean add` or create files manually.*
+The orchestrator scans for new projects every ~1 minute and creates the skeleton automatically.
 
 ### 7. Task Lifecycle (Visible in Obsidian)
 
@@ -346,28 +346,14 @@ Key decisions:
 | pytest verification | ✅ | `verification.py` |
 | Self-test suite | ✅ | `self_test.py` |
 | CLI (init, run, status, add) | ✅ | `cli.py` |
+| Inbox processing | ✅ | `orchestrator.py: _process_inbox()` |
+| Auto-project detection | ✅ | `orchestrator.py: _detect_new_projects()` |
+| Digest generation | ✅ | `orchestrator.py: _update_digest()` |
+| STATUS.md management | ✅ | `orchestrator.py: _update_project_status()` |
 
 ### 🔄 Planned (Not Yet Implemented)
 
 | Feature | Description |
 |---------|-------------|
-| Inbox processing | Auto-convert `_inbox.md` entries to tasks |
-| Auto-project detection | Detect new folders under `Projects/` and auto-populate |
-| Digest generation | Auto-update `_digest.md` with activity feed |
-| STATUS.md compaction | Auto-compact large STATUS.md files |
 | Configuration UI | GUI for editing config without JSON |
-| Background service | Proper daemon/service mode |
-
-### 🔧 How to Implement Missing Features
-
-**Inbox Processing:**
-1. Add `process_inbox()` function in `orchestrator.py`
-2. Scan `_inbox.md` for new lines (vs `_inbox_archive.md`)
-3. Create task files for each new line
-4. Append to `_inbox_archive.md` with timestamp
-
-**Auto-Project Detection:**
-1. Add `detect_new_projects()` in `orchestrator.py`
-2. On each scan, compare `Projects/` folder list to known projects
-3. Call `ensure_project_skeleton()` for new folders
-4. Store known projects in `_active.md` or separate tracking file
+| Background service | Proper daemon/service mode (runs as systemd/init service)

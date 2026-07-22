@@ -448,6 +448,32 @@ class SelfTestSuite:
         self._test("ExecutionResult dataclass works",
                   result.success == True and result.output == "test")
 
+        # Test inbox processing
+        inbox_path = self.vault / "_inbox.md"
+        inbox_path.write_text("# Inbox\nFix the login bug\nAdd dark mode support")
+        tasks_created = orch._process_inbox()
+        self._test("Inbox processing creates tasks", tasks_created == 2,
+                  f"Created {tasks_created} tasks")
+
+        # Test digest generation
+        orch._update_digest("Test message", "info")
+        digest_path = self.vault / "_digest.md"
+        self._test("Digest updated", digest_path.exists() and "Test message" in digest_path.read_text())
+
+        # Test auto-project detection
+        new_proj_dir = self.vault / "Projects" / "brand-new-project"
+        new_proj_dir.mkdir()
+        # Should not have tasks directory yet
+        self._test("New project detected", not (new_proj_dir / "tasks").exists())
+        new_proj_count = orch._detect_new_projects()
+        self._test("Auto-populated new project", (new_proj_dir / "tasks" / "pending").exists(),
+                  f"Auto-created {new_proj_count} project(s)")
+
+        # Test STATUS.md update
+        orch._update_project_status("test-project", "Test status entry")
+        status_path = self.vault / "Projects" / "test-project" / "STATUS.md"
+        self._test("Project STATUS updated", status_path.exists() and "Test status entry" in status_path.read_text())
+
         print()
 
 

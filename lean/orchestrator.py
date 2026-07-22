@@ -24,7 +24,7 @@ from .tasks import (
     scan_pending_tasks, scan_doing_tasks, is_stale, extract_dependencies,
 )
 from .verification import verify
-from .vault import ensure_vault_skeleton, safe_vault_path, list_project_dirs
+from .vault import ensure_vault_skeleton, safe_vault_path, list_project_dirs, ensure_project_skeleton, new_task_file
 from .worker import WorkerPool
 
 
@@ -110,6 +110,205 @@ class Orchestrator:
                 recovered += 1
         
         return recovered
+    
+    # =========================================================================
+    # Inbox Processing
+    # =========================================================================
+    
+    def _process_inbox(self) -> int:
+        """
+        Process _inbox.md entries and convert them to tasks.
+        
+        Scans inbox for new lines, creates task files, archives processed content.
+        Returns number of tasks created.
+        """
+        inbox_path = self.vault_root / "_inbox.md"
+        archive_path = self.vault_root / "_inbox_archive.md"
+        
+        if not inbox_path.exists():
+            return 0
+        
+        inbox_content = inbox_path.read_text(encoding="utf-8")
+        if not inbox_content.strip():
+            return 0
+        
+        # Get active project (default to "default")
+        active_project = self._get_active_project()
+        
+        # Parse inbox lines (non-empty, non-header lines)
+        lines = inbox_content.split("\n")
+        new_lines = []
+        tasks_created = 0
+        
+        for line in lines:
+            stripped = line.strip()
+            # Skip empty lines and markdown headers
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(line)
+                continue
+            
+            # Skip lines that look like they're already task descriptions (too short or too long)
+            if len(stripped) < 10 or len(stripped) > 500:
+                new_lines.append(line)
+                continue
+            
+            # This is a task entry - create it
+            try:
+                task_path = new_task_file(
+                    self.vault_root / "Projects" / active_project,
+                    "general",
+                    stripped,
+                )
+                tasks_created += 1
+                self.log(f"Inbox: created task from '{stripped[:50]}...'")
+                
+                # Archive this line with timestamp
+                timestamp = datetime.now().isoformat()
+                archive_path.write_text(
+                    f"\n[{timestamp}] {stripped}",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                self.log(f"Inbox: failed to create task: {e}")
+                new_lines.append(line)
+        
+        # Update inbox with remaining content
+        inbox_path.write_text("\n".join(new_lines), encoding="utf-8")
+        
+        return tasks_created
+    
+    def _get_active_project(self) -> str:
+        """Get the currently active project name."""
+        active_path = self.vault_root / "_active.md"
+        if active_path.exists():
+            return active_path.read_text().strip() or "default"
+        return "default"
+    
+    # =========================================================================
+    # Auto-Project Detection
+    # =========================================================================
+    
+    def _detect_new_projects(self) -> int:
+        """
+        Detect new project folders and auto-populate them with skeleton.
+        
+        Returns number of new projects created.
+        """
+        projects_root = self.vault_root / "Projects"
+        if not projects_root.exists():
+            return 0
+        
+        new_projects = 0
+        for project_dir in projects_root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            
+            # Check if this project needs skeleton (missing tasks/pending, etc.)
+            tasks_dir = project_dir / "tasks"
+            if not tasks_dir.exists():
+                try:
+                    ensure_project_skeleton(self.vault_root, project_dir.name)
+                    self.log(f"Auto-populated skeleton for project: {project_dir.name}")
+                    new_projects += 1
+                except Exception as e:
+                    self.log(f"Failed to create skeleton for {project_dir.name}: {e}")
+        
+        return new_projects
+    
+    # =========================================================================
+    # Digest Generation
+    # =========================================================================
+    
+    def _update_digest(self, message: str, level: str = "info") -> None:
+        """
+        Add an entry to _digest.md with timestamp.
+        
+        Args:
+            message: The digest message to add
+            level: Log level (info, success, warning, error)
+        """
+        digest_path = self.vault_root / "_digest.md"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        level_icons = {
+            "info": "ℹ️",
+            "success": "✅",
+            "warning": "⚠️",
+            "error": "❌",
+        }
+        icon = level_icons.get(level, "ℹ️")
+        
+        # Read existing digest
+        existing = ""
+        if digest_path.exists():
+            existing = digest_path.read_text(encoding="utf-8")
+        
+        # Append new entry
+        new_entry = f"\n[{timestamp}] {icon} {message}"
+        
+        # Keep only last 100 entries (compaction)
+        lines = existing.strip().split("\n") if existing.strip() else []
+        if len(lines) > 100:
+            lines = lines[-100:]
+        
+        digest_path.write_text("\n".join(lines) + new_entry + "\n", encoding="utf-8")
+    
+    def _compact_digest(self) -> None:
+        """Compact _digest.md if it exceeds max size."""
+        digest_path = self.vault_root / "_digest.md"
+        if not digest_path.exists():
+            return
+        
+        # Archive to _archive/_digest/
+        archive_dir = self.vault_root / "_archive" / "_digest"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        content = digest_path.read_text(encoding="utf-8")
+        if len(content) > 50000:  # 50KB threshold
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive_file = archive_dir / f"digest_{timestamp}.md"
+            archive_file.write_text(content, encoding="utf-8")
+            # Keep last 50 entries
+            lines = content.strip().split("\n")
+            digest_path.write_text("\n".join(lines[-50:]) + "\n", encoding="utf-8")
+            self.log(f"Archived digest to {archive_file.name}")
+    
+    # =========================================================================
+    # STATUS.md Management
+    # =========================================================================
+    
+    def _update_project_status(self, project_name: str, message: str) -> None:
+        """Add an entry to a project's STATUS.md."""
+        status_path = self.vault_root / "Projects" / project_name / "STATUS.md"
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = f"\n[{timestamp}] {message}"
+        
+        existing = ""
+        if status_path.exists():
+            existing = status_path.read_text(encoding="utf-8")
+        
+        status_path.write_text(existing + entry + "\n", encoding="utf-8")
+    
+    def _compact_status(self, project_name: str) -> None:
+        """Compact STATUS.md if it exceeds max size."""
+        status_path = self.vault_root / "Projects" / project_name / "STATUS.md"
+        if not status_path.exists():
+            return
+        
+        # Archive to _archive/<project>/
+        archive_dir = self.vault_root / "_archive" / project_name
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        content = status_path.read_text(encoding="utf-8")
+        if len(content) > 50000:  # 50KB threshold
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive_file = archive_dir / f"status_{timestamp}.md"
+            archive_file.write_text(content, encoding="utf-8")
+            # Keep last 100 entries
+            lines = content.strip().split("\n")
+            status_path.write_text("\n".join(lines[-100:]) + "\n", encoding="utf-8")
+            self.log(f"Archived STATUS.md for {project_name}")
     
     # =========================================================================
     # Task Execution
@@ -363,17 +562,43 @@ class Orchestrator:
 
     def _run(self) -> None:
         """Main polling loop."""
+        # Track cycle count for periodic tasks
+        cycle_count = 0
+        
         while not self._stop.is_set():
-            # Recover stale tasks
+            cycle_count += 1
+            
+            # === Periodic housekeeping (every 60 cycles ≈ 1 minute) ===
+            if cycle_count % 60 == 0:
+                # Detect new projects
+                new_proj = self._detect_new_projects()
+                if new_proj:
+                    self._update_digest(f"Auto-populated {new_proj} new project(s)", "info")
+                
+                # Compact digest if needed
+                self._compact_digest()
+                
+                # Compact STATUS.md for all projects
+                for project_dir in list_project_dirs(self.vault_root):
+                    self._compact_status(project_dir.name)
+            
+            # === Process inbox (every 10 cycles ≈ 10 seconds) ===
+            if cycle_count % 10 == 0:
+                inbox_tasks = self._process_inbox()
+                if inbox_tasks > 0:
+                    self._update_digest(f"Created {inbox_tasks} task(s) from inbox", "info")
+            
+            # === Recover stale tasks ===
             self._sweep_stale_claims(max_age_minutes=self.config.get("stale_claim_minutes", 30))
             
-            # Scan pending tasks and build graph
+            # === Scan pending tasks and build graph ===
             pending_paths = scan_pending_tasks(self.vault_root)
             graph = build_graph_from_paths(pending_paths)
             
             # Check for cycles
             if graph.detect_cycle():
                 self.log("WARNING: Dependency cycle detected")
+                self._update_digest("Dependency cycle detected in task graph", "warning")
             
             # Get ready tasks
             ready = graph.get_ready()
@@ -398,10 +623,29 @@ class Orchestrator:
     def _execute_and_release(self, task_path: Path, worker) -> None:
         """Execute task and release worker."""
         success = False
+        task_name = task_path.stem
         try:
             result = self.execute_task(task_path)
             success = result.success
-        except Exception:
+            
+            # Update digest and project status
+            if success:
+                self._update_digest(f"Completed task: {task_name}", "success")
+                # Determine project from path
+                if "/Projects/" in str(task_path):
+                    parts = task_path.parts
+                    proj_idx = parts.index("Projects") + 1
+                    project = parts[proj_idx] if proj_idx < len(parts) else "default"
+                    self._update_project_status(project, f"✅ Completed: {task_name}")
+            else:
+                self._update_digest(f"Failed task: {task_name}", "error")
+                if "/Projects/" in str(task_path):
+                    parts = task_path.parts
+                    proj_idx = parts.index("Projects") + 1
+                    project = parts[proj_idx] if proj_idx < len(parts) else "default"
+                    self._update_project_status(project, f"❌ Failed: {task_name}")
+        except Exception as e:
             success = False
+            self._update_digest(f"Task error {task_name}: {e}", "error")
         finally:
             worker.finish_job(success=success)

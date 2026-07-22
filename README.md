@@ -1,177 +1,118 @@
-# Vault Orchestrator
+# Lean Vault Orchestrator
 
-AI-powered task orchestration with multi-agent architecture.
+Hybrid architecture: deterministic code handles orchestration, AI handles inference only.
 
-## Features
+## Principles
 
-- **Multi-Agent System**: Planner, Executor, and Reviewer agents work together
-- **Git Workflow**: Branch, commit, and rollback support
-- **Verification Pipeline**: Lint, type check, and test execution
-- **Sandbox Execution**: Isolated code execution with resource limits
-- **Live Dashboard**: Real-time monitoring of jobs and workers
-- **Debugging**: Full execution traces and metrics
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/openhands/vault-orchestrator
-cd vault-orchestrator
-
-# Install
-pip install -e .
-
-# Or with dev dependencies
-pip install -e ".[dev]"
-```
-
-## Quick Start
-
-### 1. Create a Vault
-
-```bash
-vault-orchestrator init ~/my-vault
-cd ~/my-vault
-```
-
-### 2. Configure Workers
-
-Edit `config.json`:
-
-```json
-{
-  "workers": [
-    {
-      "name": "gpt-4",
-      "model": "gpt-4",
-      "base_url": "https://api.openai.com/v1",
-      "api_key": "your-key-here",
-      "task_types": ["coding", "general"]
-    }
-  ]
-}
-```
-
-### 3. Create a Project
-
-```bash
-vault-orchestrator new-project MyProject
-```
-
-### 4. Add a Task
-
-Create `Projects/MyProject/tasks/pending/fix_bug.md`:
-
-```markdown
-Fix the login bug where users get logged out after 5 minutes.
-
-Acceptance:
-- All tests pass
-- No lint errors
-```
-
-### 5. Run
-
-```bash
-vault-orchestrator run
-```
+1. **AI performs inference only** - Code writes, AI decides
+2. **Deterministic infrastructure** - DAG, indexing, verification are code
+3. **Multiple workers** - Parallel execution with dependency constraints
+4. **Bubbles** - Each worker isolated until verified
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   MultiAgentOrchestrator                     │
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐ │
-│  │   PLANNER    │───▶│  EXECUTOR    │───▶│  REVIEWER   │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      DETERMINISTIC CODE                           │
+│                                                                  │
+│  Dependency Graph ──→ Ready Queue ──→ Worker Dispatch         │
+│  Code Indexer ────→ Relevant Files ──→ Context                 │
+│  Verification Pipeline (pytest) ──→ Pass/Fail                   │
+│  Rollback Manager ───→ Snapshot/Restore                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      AI WORKERS                                  │
+│                                                                  │
+│  Worker 1: task + context → read/write/execute → verified       │
+│  Worker 2: task + context → read/write/execute → verified       │
+│  Worker N: ...                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Task Lifecycle
+## What Code Does
 
-```
-PENDING → EXPLORED → PLANNED → EXECUTING → VERIFYING
-                                      ↓            ↓
-                                   REVISION ←──────┘
-                                      ↓
-                                  COMPLETED
-```
+| Component | Responsibility |
+|-----------|----------------|
+| `vault.py` | Path containment, security |
+| `tasks.py` | Task lifecycle, claim/release |
+| `worker.py` | Worker state, metrics, cooldown |
+| `dependency.py` | DAG from task deps, cycle detection |
+| `indexer.py` | File relevance search |
+| `verification.py` | pytest execution |
+| `rollback.py` | Snapshot/restore |
+| `sandbox.py` | Command isolation |
+| `orchestrator.py` | Worker pool, task dispatch |
 
-## Project Structure
+## What AI Does
 
-```
-vault/
-├── config.json           # Configuration
-├── Projects/
-│   └── MyProject/
-│       ├── tasks/
-│       │   ├── pending/   # New tasks
-│       │   ├── doing/    # Currently running
-│       │   └── done/     # Completed tasks
-│       └── (project files)
-└── _logs/               # Execution logs
-```
+- Reads pre-selected relevant files
+- Writes code
+- Executes commands
+- Decides how to fix issues
 
-## CLI Commands
+## Usage
 
 ```bash
-# Initialize a new vault
-vault-orchestrator init <path>
+# Install
+pip install -e .
 
-# Run the orchestrator
-vault-orchestrator run
+# Initialize vault
+lean init ~/vault
 
-# Create a new project
-vault-orchestrator new-project <name>
+# Add API key to config.json
+vim ~/vault/config.json
 
-# List pending tasks
-vault-orchestrator list
+# Add tasks
+lean add ~/vault "Fix login bug" auth
+lean add ~/vault "Add tests" --depends-on auth
 
-# View status
-vault-orchestrator status
+# Run
+lean run ~/vault
 ```
 
-## API Usage
+## Task Format
 
-```python
-from vault_orchestrator import (
-    WorkerPool, JobStore, LiveDashboard, Tracer
-)
+Tasks are markdown files:
 
-# Initialize
-worker_pool = WorkerPool(config)
-job_store = JobStore(vault_root)
-dashboard = LiveDashboard(log_fn=print)
+```markdown
+<!-- meta: type=coding attempts=0 -->
 
-# Process a job
-job = job_store.enqueue("Projects/MyProject/task.md", "coding", "MyProject")
-worker = worker_pool.get_available("coding")
-job_store.assign(job, worker)
+Fix the login timeout bug.
 
-# Track with tracer
-tracer = Tracer(job.id, task_description)
-tracer.reasoning("Starting task", confidence=0.9)
-
-# Run executor...
+depends-on: task-xxx
 ```
 
-## Development
+## Files
 
-```bash
-# Run tests
-pytest vault_orchestrator/tests/
+```
+lean/
+├── __init__.py       # Package
+├── agent.py          # AI interface (80 lines)
+├── cli.py            # Entry point (140 lines)
+├── config.py         # Config (40 lines)
+├── dependency.py    # DAG (160 lines)
+├── indexer.py        # Relevance (180 lines)
+├── orchestrator.py   # Main loop (350 lines)
+├── rollback.py       # Snapshot (70 lines)
+├── sandbox.py        # Isolation (60 lines)
+├── tasks.py          # Task lifecycle (140 lines)
+├── vault.py          # Security (70 lines)
+├── verification.py  # Tests (130 lines)
+├── worker.py        # Worker state (200 lines)
+└── pyproject.toml
 
-# Lint
-ruff check vault_orchestrator/
-
-# Type check
-mypy vault_orchestrator/
-
-# Format
-ruff format vault_orchestrator/
+Total: ~1620 lines
 ```
 
-## License
+## vs Original
 
-MIT
+| Metric | Original | Lean |
+|--------|----------|------|
+| Lines | ~15,000 | ~1,620 |
+| AI role | Multi-agent | Inference only |
+| Planner/Reviewer/Supervisor | Yes | No |
+| DAG | Complex | Simple |
+| Verification | AI + tools | Tools only |
+| Full metrics | Partial | Yes |
+| Multi-worker | Yes | Yes |

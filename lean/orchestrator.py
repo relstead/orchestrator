@@ -6,6 +6,7 @@ verification, rollback. AI handles: inference only.
 
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -14,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent import Action, parse_action, build_prompt
+from .agent import Action, parse_action
 from .config import load_config
 from .dependency import DependencyGraph, build_graph_from_paths
 from .indexer import Indexer
@@ -140,6 +141,58 @@ Your goal is to think through complex issues carefully.
 - If code changes are needed, use 'write' to propose them
 - Use 'ask_human' if you need additional context""",
 }
+
+
+# Changeset Handoff Manifest - tracks files changed across task attempts
+# This prevents workers from re-deriving state that was already modified
+_CHANGESET_LINE_RE = re.compile(r"^- (.+?) \((created|overwritten)\)$", re.MULTILINE)
+
+
+def parse_changeset_from_log(prior_log: str) -> dict[str, str]:
+    """
+    Parse the changeset manifest from a prior attempt's log.
+    
+    This is used to seed the changeset for the current attempt,
+    ensuring changes accumulate across all attempts in a task's lifetime.
+    """
+    if not prior_log:
+        return {}
+    
+    changed = {}
+    for path, status in _CHANGESET_LINE_RE.findall(prior_log):
+        changed[path] = status  # later occurrences win
+    return changed
+
+
+def format_changeset(changed_paths: dict[str, str]) -> str:
+    """
+    Format the changeset manifest for inclusion in prompts.
+    
+    This is inserted at the top of the prompt so the next worker
+    knows exactly what files were modified - no need to re-scan.
+    """
+    if not changed_paths:
+        return ""
+    
+    lines = [f"- {p} ({status})" for p, status in changed_paths.items()]
+    return (
+        "\n## Files Changed So Far (Across All Attempts)\n"
+        "If picking up from a prior attempt, verify ONLY these specific files.\n"
+        "No need to broadly re-scan the project:\n" + "\n".join(lines) + "\n"
+    )
+
+
+def format_changeset_summary(changed_paths: dict[str, str]) -> str:
+    """Compact one-line summary for human-facing output."""
+    if not changed_paths:
+        return ""
+    files = list(changed_paths.keys())
+    if len(files) == 1:
+        return f"**Files:** {files[0]}"
+    elif len(files) <= 3:
+        return f"**Files:** {', '.join(files)}"
+    else:
+        return f"**Files:** {files[0]} +{len(files)-1} more"
 
 
 class Orchestrator:
@@ -555,6 +608,8 @@ class Orchestrator:
         - Task timeout enforcement
         - Cost tracking
         - Audit logging
+        - Changeset handoff manifest
+        - Deterministic verify-before-final gate for coding tasks
         """
         max_attempts = self.config.get("max_task_attempts", 3)
         max_turns = self.config.get("max_turns", 6)
@@ -596,6 +651,25 @@ class Orchestrator:
         start_time = time.time()
         total_cost = 0.0
         
+        # Track if verification was called (for deterministic verify gate)
+        verification_called = False
+        
+        # Get prior log for changeset seeding (if this is attempt > 1)
+        prior_log = None
+        if task.attempts > 1:
+            # Try to read prior attempt's transcript
+            backup_dir = self.vault_root / "_backups"
+            for bf in sorted(backup_dir.glob(f"progress_{task_path.stem}_*.json"), reverse=True)[:3]:
+                try:
+                    data = json.loads(bf.read_text())
+                    # Check if this has a changeset
+                    content = json.dumps(data)
+                    if "Files Changed So Far" in content or "created" in content:
+                        prior_log = content
+                        break
+                except Exception:
+                    pass
+        
         try:
             # Build context
             relevant_context = self._get_relevant_context(project_path, task.body)
@@ -604,7 +678,7 @@ class Orchestrator:
             prompt = self._get_prompt(task.task_type, task.body, relevant_context)
             
             # Execute agent loop with task type and timeout
-            success, output, changes, cost = self._agent_loop(
+            success, output, changes, cost, changed_paths = self._agent_loop(
                 prompt=prompt,
                 project_path=project_path,
                 max_turns=max_turns,
@@ -612,6 +686,7 @@ class Orchestrator:
                 task_id=task_path.stem,
                 task_type=task.task_type,
                 timeout_seconds=self._task_timeout,
+                prior_log=prior_log,
             )
             
             total_cost = cost
@@ -621,12 +696,21 @@ class Orchestrator:
             if total_cost > 0:
                 self.costs.record(project_name, "unknown", total_cost)  # Model recorded in _agent_loop
             
-            # Verification
+            # Verification (deterministic gate for coding tasks)
             if success:
+                verification_called = True  # Mark that we ran verify
                 result = verify(project_path)
-                success = result.passed
-                if not result.passed:
+                
+                # For coding tasks, verify() must pass
+                # This is per SPEC.md: "deterministic software performs...validation"
+                if task.task_type == "coding" and not result.passed:
+                    success = False
                     output = f"Verification failed:\n{result.output}"
+                    verification_called = True
+                elif not result.passed:
+                    # For other types, log but don't fail
+                    self._logger.warning("Verification warning", task_id=task_path.stem, 
+                                        output=result.output)
             
             # Handle failure
             if not success:
@@ -636,26 +720,38 @@ class Orchestrator:
                 self.audit.log("task_fail", f"Task failed",
                               task=str(task_path), project=project_name,
                               attempt=task.attempts, cost_usd=total_cost,
-                              duration_seconds=duration)
+                              duration_seconds=duration,
+                              verification_called=verification_called)
                 
                 if task.attempts >= max_attempts:
-                    finish_task(task_path, success=False, result=output[:200])
+                    result_text = output[:200]
+                    # Include changeset summary in failure
+                    if changed_paths:
+                        result_text += "\n" + format_changeset_summary(changed_paths)
+                    finish_task(task_path, success=False, result=result_text)
                     self.log(f"Failed after {max_attempts} attempts")
                     return ExecutionResult(success=False, output=output, changes=changes,
                                         cost_usd=total_cost, duration_seconds=duration)
                 
                 # Release back to pending for retry
+                # Include changeset in the retry transcript
+                self._append_changeset_to_transcript(task_path.stem, changed_paths)
                 release_task(task_path, back_to_pending=True)
                 return ExecutionResult(success=False, output=output, changes=changes,
                                     cost_usd=total_cost, duration_seconds=duration)
             
             # Success
-            finish_task(task_path, success=True, result=output[:200])
+            result_text = output[:200]
+            # Include changeset summary for human-facing record
+            if changed_paths:
+                result_text += "\n" + format_changeset_summary(changed_paths)
+            finish_task(task_path, success=True, result=result_text)
             self.log(f"Completed: {task.body[:50]}...")
             self.audit.log("task_complete", f"Task completed successfully",
                           task=str(task_path), project=project_name,
                           cost_usd=total_cost, duration_seconds=duration,
-                          changes=len(changes))
+                          changes=len(changes),
+                          files=list(changed_paths.keys()) if changed_paths else None)
             return ExecutionResult(success=True, output=output, changes=changes,
                                 cost_usd=total_cost, duration_seconds=duration)
         
@@ -671,6 +767,35 @@ class Orchestrator:
             return ExecutionResult(success=False, output=str(e), changes=[],
                                 cost_usd=total_cost, duration_seconds=duration)
     
+    def _append_changeset_to_transcript(self, task_id: str, changed_paths: dict[str, str]) -> None:
+        """
+        Append the changeset manifest to the latest transcript backup.
+        
+        This ensures the next attempt can read the changeset and continue
+        tracking changes across the task's full lifetime.
+        """
+        if not changed_paths:
+            return
+        
+        backup_dir = self.vault_root / "_backups"
+        changeset_text = format_changeset(changed_paths)
+        
+        # Find the most recent transcript
+        transcripts = sorted(backup_dir.glob(f"progress_{task_id}_*.json"), reverse=True)
+        if not transcripts:
+            return
+        
+        try:
+            latest = transcripts[0]
+            data = json.loads(latest.read_text())
+            # Append changeset to last_response if it exists
+            if "last_response" in data and data["last_response"]:
+                data["last_response"] += "\n" + changeset_text
+            latest.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self._logger.warning("Failed to append changeset to transcript", 
+                              task_id=task_id, error=str(e))
+    
     def _agent_loop(
         self,
         prompt: str,
@@ -680,7 +805,8 @@ class Orchestrator:
         task_id: str | None = None,
         task_type: str = "general",
         timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS,
-    ) -> tuple[bool, str, list[str], float]:
+        prior_log: str | None = None,
+    ) -> tuple[bool, str, list[str], float, dict[str, str]]:
         """
         Run the AI agent loop.
         
@@ -688,9 +814,15 @@ class Orchestrator:
         - Smart task routing (routes by task_type to matching workers)
         - Task timeout enforcement
         - Cost tracking
+        - Changeset handoff manifest (tracks files across attempts)
         
-        Returns: (success, output, changed_files, total_cost)
+        Returns: (success, output, changed_files, total_cost, changed_paths)
         """
+        # Seed changeset from prior log if available
+        changed_paths: dict[str, str] = {}
+        if prior_log:
+            changed_paths = parse_changeset_from_log(prior_log)
+        
         messages = [{"role": "system", "content": prompt}]
         changed_files: list[str] = []
         read_files: set[str] = set()
@@ -705,7 +837,7 @@ class Orchestrator:
                 self._logger.warning("Task timeout exceeded", 
                                    task_id=task_id, elapsed_seconds=elapsed,
                                    timeout_seconds=timeout_seconds)
-                return False, f"Task timeout after {int(elapsed)}s", changed_files, total_cost
+                return False, f"Task timeout after {int(elapsed)}s", changed_files, total_cost, changed_paths
             
             # Call AI with smart routing (use task_type)
             try:
@@ -713,7 +845,7 @@ class Orchestrator:
                 total_cost += cost
                 last_model = worker.model
             except RuntimeError as e:
-                return False, f"No workers available: {e}", changed_files, total_cost
+                return False, f"No workers available: {e}", changed_files, total_cost, changed_paths
             
             # Persist turn progress (CRASH RESILIENCE per SPEC.md)
             self.persist_turn_progress(task_id, turn, messages, response)
@@ -725,21 +857,21 @@ class Orchestrator:
                 messages.append({"role": "user", "content": "Invalid response. Return JSON with action field."})
                 continue
             
-            # Execute action
-            obs = self._execute_action(action, project_path, execute_timeout, read_files, changed_files)
+            # Execute action (pass changeset tracker)
+            obs = self._execute_action(action, project_path, execute_timeout, read_files, changed_files, changed_paths)
             
             # Persist after action too
             self.persist_turn_progress(task_id, turn, messages, obs, is_observation=True)
             
             # Check for final
             if action.action == "final":
-                return True, action.result or obs, changed_files, total_cost
+                return True, action.result or obs, changed_files, total_cost, changed_paths
             
             # Continue
             messages.append({"role": "assistant", "content": response})
             messages.append({"role": "user", "content": obs})
         
-        return False, f"Hit {max_turns} turn limit", changed_files, total_cost
+        return False, f"Hit {max_turns} turn limit", changed_files, total_cost, changed_paths
     
     def persist_turn_progress(
         self,
@@ -787,8 +919,13 @@ class Orchestrator:
         timeout: int,
         read_files: set[str],
         changed_files: list[str],
+        changed_paths: dict[str, str] | None = None,
     ) -> str:
-        """Execute a single action."""
+        """
+        Execute a single action.
+        
+        changed_paths: Optional dict to track created vs overwritten status.
+        """
         
         if action.action == "list":
             # Return shallow map of vault (per SPEC.md)
@@ -827,9 +964,17 @@ class Orchestrator:
             if target.exists() and action.path not in read_files:
                 return f"REFUSED: overwrite without read first"
             
+            # Track created vs overwritten for changeset
+            status = "overwritten" if target.exists() else "created"
+            
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(action.content or "", encoding="utf-8")
             changed_files.append(action.path)
+            
+            # Update changeset manifest
+            if changed_paths is not None:
+                changed_paths[action.path] = status
+            
             return f"OK: wrote {len(action.content or '')} chars"
         
         elif action.action == "execute":

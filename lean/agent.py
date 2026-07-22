@@ -2,6 +2,9 @@
 
 AI receives task + context, outputs JSON actions.
 No exploration, no planning, no self-review.
+
+Note: build_prompt() is a standalone utility. The orchestrator uses
+DEFAULT_PROMPT_TEMPLATES in orchestrator.py instead.
 """
 
 import json
@@ -10,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Standalone prompt - orchestrator uses DEFAULT_PROMPT_TEMPLATES instead
 SYSTEM_PROMPT = """You are a coding assistant. Complete tasks by taking actions.
 
 Actions (respond with JSON):
@@ -17,6 +21,8 @@ Actions (respond with JSON):
 {"reasoning": "why", "action": "write", "path": "file", "content": "..."}
 {"reasoning": "why", "action": "execute", "command": "shell command"}
 {"reasoning": "why", "action": "final", "result": "summary"}
+{"reasoning": "why", "action": "list"}
+{"reasoning": "why", "action": "ask_human", "path": "optional-id"}
 
 Rules:
 - Read before write (overwrites existing)
@@ -36,7 +42,11 @@ class Action:
 
 
 def parse_action(text: str) -> Action | None:
-    """Parse JSON action from AI response."""
+    """Parse JSON action from AI response.
+    
+    Uses a string-aware brace counter to handle content with braces inside
+    string values (common in code, JSON, CSS, etc.).
+    """
     text = text.strip()
     
     if text.startswith("```"):
@@ -48,24 +58,41 @@ def parse_action(text: str) -> Action | None:
         return None
     
     depth = 0
+    in_string = False
+    escape_next = False
+    
     for i, c in enumerate(text[start:], start):
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    data = json.loads(text[start:i+1])
-                    return Action(
-                        reasoning=data.get("reasoning", ""),
-                        action=data.get("action", ""),
-                        path=data.get("path"),
-                        content=data.get("content"),
-                        command=data.get("command"),
-                        result=data.get("result"),
-                    )
-                except json.JSONDecodeError:
-                    return None
+        if escape_next:
+            escape_next = False
+            continue
+        
+        if c == "\\":
+            escape_next = True
+            continue
+        
+        if c == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        
+        # Only count braces outside of strings
+        if not in_string:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(text[start:i+1])
+                        return Action(
+                            reasoning=data.get("reasoning", ""),
+                            action=data.get("action", ""),
+                            path=data.get("path"),
+                            content=data.get("content"),
+                            command=data.get("command"),
+                            result=data.get("result"),
+                        )
+                    except json.JSONDecodeError:
+                        return None
     return None
 
 

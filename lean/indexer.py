@@ -98,9 +98,16 @@ class Indexer:
         return []
 
     def _extract_words(self, content: str) -> set[str]:
-        """Extract significant words."""
+        """Extract significant words.
+        
+        Only strips C-style // comments, preserving markdown headings (#).
+        This is intentional - markdown content (TTRPG, worldbuilding, docs)
+        uses # for headings which should be indexed.
+        """
+        # Remove quoted strings first
         content = re.sub(r'["\'].*?["\']', "", content)
-        content = re.sub(r"//.*|#.*", "", content)
+        # Only strip // comments, NOT # (markdown headings)
+        content = re.sub(r"//.*", "", content)
         words = re.findall(r"\b[a-z_][a-z0-9_]{2,}\b", content.lower())
         stop = {"the", "and", "for", "are", "but", "not", "you", "all", "can", "return", "import", "class", "def", "function", "const"}
         return {w for w in words if w not in stop and len(w) > 3}

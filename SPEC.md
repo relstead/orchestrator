@@ -376,6 +376,10 @@ Key decisions:
 | Prompt templates | ✅ | `orchestrator.py: DEFAULT_PROMPT_TEMPLATES` |
 | Secret management (env vars) | ✅ | `config.py: _resolve_env_vars()` |
 | CLI enhancements (logs, task, pause) | ✅ | `cli.py` |
+| Changeset handoff manifest | ✅ | `orchestrator.py: parse_changeset_from_log()` |
+| Deterministic verify gate | ✅ | `orchestrator.py: execute_task()` |
+| String-aware JSON parsing | ✅ | `agent.py: parse_action()` |
+| Markdown heading preservation | ✅ | `indexer.py: _extract_words()` |
 
 ### 🔄 Planned (Not Yet Implemented)
 

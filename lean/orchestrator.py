@@ -35,6 +35,134 @@ from .worker import WorkerPool
 DEFAULT_TASK_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
+class KnowledgeProvider:
+    """Facade for knowledge/index operations.
+    
+    Wraps Indexer + ObservationCache to provide a clean interface for
+    knowledge operations. In-process, no RPC, no new thread.
+    """
+    
+    def __init__(self, indexer: Indexer):
+        self._indexer = indexer
+        self._cache = ObservationCache(indexer)
+    
+    def clear_cache(self) -> None:
+        """Clear the observation cache."""
+        self._cache.clear()
+    
+    def get_cache_stats(self) -> dict:
+        """Get cache statistics."""
+        return self._cache.get_stats()
+    
+    def find_references(self, symbol: str) -> list:
+        """Find all files that define or reference a symbol."""
+        return self._cache.find_references(symbol)
+    
+    def find_definition(self, symbol: str) -> list:
+        """Find files that define a specific symbol."""
+        return self._cache.find_definition(symbol)
+    
+    def find_importers(self, module: str) -> list:
+        """Find files that import a specific module."""
+        return self._cache.find_importers(module)
+    
+    def project_summary(self) -> dict:
+        """Get a summary of the indexed project."""
+        return {
+            "files": len(self._indexer.files),
+            "symbols": len(self._indexer._symbol_index),
+            "languages": list(set(f.language for f in self._indexer.files.values() if f.language)),
+        }
+
+
+class ObservationCache:
+    """Per-attempt cache for deterministic index lookups.
+    
+    Caches results of find_references, find_definition, find_importers
+    and invalidates entries when their dependent files are modified.
+    """
+    
+    def __init__(self, indexer: Indexer):
+        self._indexer = indexer
+        # Cache: (method_name, query) -> (result, dependent_files)
+        self._cache: dict[tuple[str, str], tuple[list, frozenset]] = {}
+    
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        self._cache.clear()
+    
+    def find_references(self, symbol: str) -> list:
+        """Find references with caching."""
+        key = ("find_references", symbol)
+        
+        if key in self._cache:
+            result, _ = self._cache[key]
+            return result
+        
+        # Call the indexer and cache
+        result = self._indexer.find_references(symbol)
+        
+        # Track which files this result depends on
+        dependent_files = frozenset(entry.path for entry in result)
+        self._cache[key] = (result, dependent_files)
+        return result
+    
+    def find_definition(self, symbol: str) -> list:
+        """Find definition with caching."""
+        key = ("find_definition", symbol)
+        
+        if key in self._cache:
+            result, _ = self._cache[key]
+            return result
+        
+        # Call the indexer and cache
+        result = self._indexer.find_definition(symbol)
+        
+        # Track which files this result depends on
+        dependent_files = frozenset(entry.path for entry in result)
+        self._cache[key] = (result, dependent_files)
+        return result
+    
+    def find_importers(self, module: str) -> list:
+        """Find importers with caching."""
+        key = ("find_importers", module)
+        
+        if key in self._cache:
+            result, _ = self._cache[key]
+            return result
+        
+        # Call the indexer and cache
+        result = self._indexer.find_importers(module)
+        
+        # Track which files this result depends on
+        dependent_files = frozenset(entry.path for entry in result)
+        self._cache[key] = (result, dependent_files)
+        return result
+    
+    def invalidate_file(self, file_path: str) -> None:
+        """Invalidate cache entries that depend on the given file.
+        
+        Any cached entry that references the given file path is dropped.
+        """
+        path_to_remove = file_path if not file_path.startswith('/') else file_path
+        
+        # Find and remove cache entries that depend on this file
+        keys_to_remove = []
+        for (method, query), (result, dependent_files) in self._cache.items():
+            if path_to_remove in dependent_files:
+                keys_to_remove.append((method, query))
+        
+        for key in keys_to_remove:
+            del self._cache[key]
+    
+    def get_stats(self) -> dict:
+        """Get cache statistics for debugging."""
+        return {
+            "entries": len(self._cache),
+            "methods": len(set(k[0] for k in self._cache.keys())),
+        }
+
+
 @dataclass
 class ExecutionResult:
     """Result of task execution."""
@@ -129,6 +257,9 @@ Be concise and focused.""",
     "coding": """You are an expert programmer working on code in a project.
 Your goal is to implement, fix, or refactor code efficiently.
 - Start by exploring the codebase with 'list' and 'read'
+- Use 'find_references' to find where a symbol is used
+- Use 'find_definition' to find where a symbol is defined
+- Use 'find_importers' to find files that import a module
 - Make targeted changes with 'write'
 - Use 'execute' to run tests or build commands
 - If tests fail, analyze the output and iterate
@@ -242,6 +373,9 @@ class Orchestrator:
         
         # Project index cache
         self._index_cache: dict[str, Indexer] = {}
+        
+        # Per-attempt knowledge provider (per project) - wraps Indexer + ObservationCache
+        self._knowledge_providers: dict[str, KnowledgeProvider] = {}
         
         # Control
         self._stop = threading.Event()
@@ -824,12 +958,18 @@ class Orchestrator:
         - Task timeout enforcement
         - Cost tracking
         - Changeset handoff manifest (tracks files across attempts)
+        - Observation cache for deterministic lookups (per-attempt)
         
         worker: Optional pre-reserved worker. If provided, uses that worker directly
         instead of re-selecting from the pool.
         
         Returns: (success, output, changed_files, total_cost, changed_paths)
         """
+        # Clear knowledge provider cache for this project at the start of each attempt
+        project_key = str(project_path)
+        if project_key in self._knowledge_providers:
+            self._knowledge_providers[project_key].clear_cache()
+        
         # Seed changeset from prior log if available
         changed_paths: dict[str, str] = {}
         if prior_log:
@@ -1014,6 +1154,11 @@ class Orchestrator:
             if changed_paths is not None:
                 changed_paths[action.path] = status
             
+            # Invalidate knowledge provider cache for this file
+            rel_path = str(target.relative_to(project_path))
+            if project_path in self._knowledge_providers:
+                self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
+            
             return f"OK: wrote {len(action.content or '')} chars"
         
         elif action.action == "apply_patch":
@@ -1053,6 +1198,11 @@ class Orchestrator:
             # Update changeset manifest
             if changed_paths is not None:
                 changed_paths[action.path] = "overwritten"
+            
+            # Invalidate knowledge provider cache for this file
+            rel_path = str(target.relative_to(project_path))
+            if project_path in self._knowledge_providers:
+                self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
             
             return f"OK: patched {len(old_text)} → {len(new_text)} chars"
         
@@ -1112,6 +1262,12 @@ class Orchestrator:
                 
                 results.append(f"{patch['path']}: {len(old_text)} → {len(new_text)}")
             
+            # Invalidate knowledge provider cache for all patched files
+            if project_path in self._knowledge_providers:
+                for patch in patches:
+                    rel_path = patch["path"]
+                    self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
+            
             return "OK: " + "; ".join(results)
         
         elif action.action == "find_references":
@@ -1119,13 +1275,15 @@ class Orchestrator:
             if not action.path:
                 return "ERROR: find_references requires path (the symbol to search for)"
             
-            # Get or create indexer for this project
-            if project_path not in self._index_cache:
-                self._index_cache[project_path] = Indexer(project_path)
-                self._index_cache[project_path].build()
+            # Get or create knowledge provider for this project
+            if project_path not in self._knowledge_providers:
+                if project_path not in self._index_cache:
+                    self._index_cache[project_path] = Indexer(project_path)
+                    self._index_cache[project_path].build()
+                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
             
-            indexer = self._index_cache[project_path]
-            results = indexer.find_references(action.path)
+            provider = self._knowledge_providers[project_path]
+            results = provider.find_references(action.path)
             
             if not results:
                 return f"No references found for '{action.path}'"
@@ -1137,6 +1295,54 @@ class Orchestrator:
                     syms = [s for s in entry.symbols if action.path in s]
                     if syms:
                         lines.append(f"  Symbols: {', '.join(syms[:5])}")
+            
+            return "\n".join(lines)
+        
+        elif action.action == "find_definition":
+            """Find files that define a symbol."""
+            if not action.path:
+                return "ERROR: find_definition requires path"
+            
+            # Get or create knowledge provider for this project
+            if project_path not in self._knowledge_providers:
+                if project_path not in self._index_cache:
+                    self._index_cache[project_path] = Indexer(project_path)
+                    self._index_cache[project_path].build()
+                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
+            
+            provider = self._knowledge_providers[project_path]
+            results = provider.find_definition(action.path)
+            
+            if not results:
+                return f"No definition found for '{action.path}'"
+            
+            lines = [f"# Definition of '{action.path}'"]
+            for entry in results:
+                lines.append(f"- {entry.path} ({entry.line_count} lines)")
+            
+            return "\n".join(lines)
+        
+        elif action.action == "find_importers":
+            """Find files that import a module."""
+            if not action.path:
+                return "ERROR: find_importers requires path"
+            
+            # Get or create knowledge provider for this project
+            if project_path not in self._knowledge_providers:
+                if project_path not in self._index_cache:
+                    self._index_cache[project_path] = Indexer(project_path)
+                    self._index_cache[project_path].build()
+                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
+            
+            provider = self._knowledge_providers[project_path]
+            results = provider.find_importers(action.path)
+            
+            if not results:
+                return f"No importers found for '{action.path}'"
+            
+            lines = [f"# Importers of '{action.path}'"]
+            for entry in results:
+                lines.append(f"- {entry.path} ({entry.line_count} lines)")
             
             return "\n".join(lines)
         

@@ -221,6 +221,29 @@ class Indexer:
         # Fall back to keyword search
         return self.find_relevant(symbol, top_n=10)
 
+    def find_definition(self, symbol: str) -> list[FileEntry]:
+        """Find files that define a specific symbol.
+        
+        Returns files that contain a class, function, or variable definition.
+        Uses symbol index for fast lookup.
+        """
+        if symbol in self._symbol_index:
+            files = self._symbol_index[symbol]
+            return [self.files[f] for f in files if f in self.files]
+        
+        return []
+
+    def find_importers(self, module: str) -> list[FileEntry]:
+        """Find files that import a specific module.
+        
+        Uses the imports list in FileEntry to find importers.
+        """
+        importers = []
+        for entry in self.files.values():
+            if module in entry.imports:
+                importers.append(entry)
+        return importers
+
     def find_tests(self, symbol: str) -> list[FileEntry]:
         """Find test files related to a symbol.
         

@@ -24,12 +24,18 @@ Actions (respond with JSON):
 {"reasoning": "why", "action": "final", "result": "summary"}
 {"reasoning": "why", "action": "list"}
 {"reasoning": "why", "action": "ask_human", "path": "optional-id"}
+{"reasoning": "why", "action": "find_references", "path": "symbol_name"}
+{"reasoning": "why", "action": "find_definition", "path": "symbol_name"}
+{"reasoning": "why", "action": "find_importers", "path": "module_name"}
 
 Rules:
 - Read before write (overwrites existing)
 - apply_patch: use for targeted edits; must match old_text exactly
 - Execute runs in project folder
-- Call final when task complete"""
+- Call final when task complete
+- find_references: find files that define or reference a symbol
+- find_definition: find files that define a specific symbol
+- find_importers: find files that import a specific module"""
 
 
 @dataclass

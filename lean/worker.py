@@ -78,6 +78,9 @@ class Worker:
     # From last response
     finish_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    
+    # Per-model pricing (optional, overrides defaults)
+    pricing: dict[str, float] | None = None
 
     def is_available(self, task_type: str) -> bool:
         """Check if worker can handle this task type and is available."""
@@ -190,6 +193,7 @@ class Worker:
             enabled=config.get("enabled", True),
             failure_threshold=config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD),
             recovery_timeout_minutes=config.get("recovery_timeout_minutes", DEFAULT_RECOVERY_TIMEOUT_MINUTES),
+            pricing=config.get("pricing", None),
         )
 
 
@@ -307,8 +311,8 @@ class WorkerPool:
                 worker.finish_reason = data.get("choices", [{}])[0].get("finish_reason")
                 worker.usage = data.get("usage", {})
                 
-                # Calculate and return cost
-                cost = self.estimate_cost(worker.usage)
+                # Calculate and return cost using worker-specific pricing
+                cost = self.estimate_cost(worker.usage, worker.pricing)
                 
                 return worker, data["choices"][0]["message"]["content"], cost
             
@@ -379,8 +383,8 @@ class WorkerPool:
             worker.finish_reason = data.get("choices", [{}])[0].get("finish_reason")
             worker.usage = data.get("usage", {})
             
-            # Calculate and return cost
-            cost = self.estimate_cost(worker.usage)
+            # Calculate and return cost using worker-specific pricing
+            cost = self.estimate_cost(worker.usage, worker.pricing)
             
             return worker, data["choices"][0]["message"]["content"], cost
         

@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent import Action, parse_action
+from .agent import Action, parse_action, SYSTEM_PROMPT
 from .config import load_config
 from .dependency import DependencyGraph, build_graph_from_paths
 from .indexer import Indexer
@@ -27,7 +27,7 @@ from .tasks import (
     scan_pending_tasks, scan_doing_tasks, is_stale, extract_dependencies,
 )
 from .verification import verify
-from .vault import ensure_vault_skeleton, safe_vault_path, list_project_dirs, ensure_project_skeleton, new_task_file
+from .vault import ensure_vault_skeleton, safe_vault_path, safe_project_path, list_project_dirs, ensure_project_skeleton, new_task_file
 from .worker import WorkerPool
 
 
@@ -241,36 +241,11 @@ class CostTracker:
         return self._costs.copy()
 
 
-# Prompt templates per task type
+# Prompt templates per task type (imported from agent.py for consistency)
 DEFAULT_PROMPT_TEMPLATES = {
-    "general": """You are an AI assistant working with a project. 
-Your goal is to complete the task efficiently using the available actions.
-- Use 'list' to explore the project structure
-- Use 'read' to examine files
-- Use 'write' to make changes (in the current project only)
-- Use 'execute' sparingly and only safe commands
-- Use 'ask_human' if you need clarification
-- Use 'final' when the task is complete
-
-Be concise and focused.""",
-    
-    "coding": """You are an expert programmer working on code in a project.
-Your goal is to implement, fix, or refactor code efficiently.
-- Start by exploring the codebase with 'list' and 'read'
-- Use 'find_references' to find where a symbol is used
-- Use 'find_definition' to find where a symbol is defined
-- Use 'find_importers' to find files that import a module
-- Make targeted changes with 'write'
-- Use 'execute' to run tests or build commands
-- If tests fail, analyze the output and iterate
-- Use 'final' when the code is complete and tested""",
-    
-    "reasoning": """You are a reasoning assistant analyzing problems deeply.
-Your goal is to think through complex issues carefully.
-- Use 'read' to gather all relevant information
-- Think step by step and use 'final' with your analysis
-- If code changes are needed, use 'write' to propose them
-- Use 'ask_human' if you need additional context""",
+    "general": SYSTEM_PROMPT,
+    "coding": SYSTEM_PROMPT,  # Same prompt - find_* actions already included
+    "reasoning": SYSTEM_PROMPT,
 }
 
 
@@ -644,7 +619,7 @@ class Orchestrator:
     
     def _update_digest(self, message: str, level: str = "info") -> None:
         """
-        Add an entry to _digest.md with timestamp.
+        Add an entry to _digest.md with timestamp (append-only).
         
         Args:
             message: The digest message to add
@@ -660,21 +635,11 @@ class Orchestrator:
             "error": "❌",
         }
         icon = level_icons.get(level, "ℹ️")
+        entry = f"\n[{timestamp}] {icon} {message}"
         
-        # Read existing digest
-        existing = ""
-        if digest_path.exists():
-            existing = digest_path.read_text(encoding="utf-8")
-        
-        # Append new entry
-        new_entry = f"\n[{timestamp}] {icon} {message}"
-        
-        # Keep only last 100 entries (compaction)
-        lines = existing.strip().split("\n") if existing.strip() else []
-        if len(lines) > 100:
-            lines = lines[-100:]
-        
-        digest_path.write_text("\n".join(lines) + new_entry + "\n", encoding="utf-8")
+        # Append-only write
+        with open(digest_path, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
     
     def _compact_digest(self) -> None:
         """Compact _digest.md if it exceeds max size."""
@@ -701,17 +666,14 @@ class Orchestrator:
     # =========================================================================
     
     def _update_project_status(self, project_name: str, message: str) -> None:
-        """Add an entry to a project's STATUS.md."""
+        """Add an entry to a project's STATUS.md (append-only)."""
         status_path = self.vault_root / "Projects" / project_name / "STATUS.md"
-        
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"\n[{timestamp}] {message}"
         
-        existing = ""
-        if status_path.exists():
-            existing = status_path.read_text(encoding="utf-8")
-        
-        status_path.write_text(existing + entry + "\n", encoding="utf-8")
+        # Append-only write
+        with open(status_path, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
     
     def _compact_status(self, project_name: str) -> None:
         """Compact STATUS.md if it exceeds max size."""
@@ -833,6 +795,21 @@ class Orchestrator:
             
             total_cost = cost
             duration = time.time() - start_time
+            
+            # P1: Retrieval hit-rate metric
+            if changed_paths or read_files:
+                indexer = self._get_indexer(project_path)
+                selected = set(f.path for f in indexer.find_relevant(task.body, top_n=5))
+                actually_used = set(read_files.keys()) | set(changed_paths.keys())
+                if selected and actually_used:
+                    precision = len(selected & actually_used) / len(selected)
+                    recall = len(selected & actually_used) / len(actually_used)
+                    self._logger.info("retrieval_metrics",
+                                     task_id=task_path.stem,
+                                     precision=round(precision, 2),
+                                     recall=round(recall, 2),
+                                     selected=len(selected),
+                                     used=len(actually_used))
             
             # Record cost
             if total_cost > 0:
@@ -1028,6 +1005,10 @@ class Orchestrator:
             # Continue
             messages.append({"role": "assistant", "content": response})
             messages.append({"role": "user", "content": obs})
+            
+            # P2: Compress stale read observations to prevent context bloat
+            if len(messages) > 6:
+                self._compress_stale_reads(messages)
         
         return False, f"Hit {max_turns} turn limit", changed_files, total_cost, changed_paths
     
@@ -1042,9 +1023,7 @@ class Orchestrator:
         """
         Write transcript to disk after every turn (CRASH RESILIENCE per SPEC.md).
         
-        Persists the conversation transcript so that if the process crashes,
-        progress can be recovered. Files are written to _backups/ with a
-        naming convention that allows identification and resumption.
+        Uses one file per task_id, overwritten each turn (not timestamped).
         """
         if task_id is None:
             return
@@ -1052,23 +1031,51 @@ class Orchestrator:
         backup_dir = self.vault_root / "_backups"
         backup_dir.mkdir(exist_ok=True)
         
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        role = "obs" if is_observation else "turn"
-        progress_file = backup_dir / f"progress_{task_id}_{turn}_{role}_{timestamp}.json"
+        # One file per task_id, overwritten each turn
+        progress_file = backup_dir / f"progress_{task_id}.json"
         
         data = {
             "task_id": task_id,
             "turn": turn,
             "is_observation": is_observation,
-            "timestamp": timestamp,
+            "timestamp": datetime.now().isoformat(),
             "messages": messages,
             "last_response": last_response,
         }
         
         try:
-            progress_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            progress_file.write_text(json.dumps(data), encoding="utf-8")
         except Exception:
             pass  # Don't fail on persistence errors
+    
+    def _compress_stale_reads(self, messages: list[dict]) -> None:
+        """Replace old read observations with one-line markers."""
+        read_paths: set[str] = set()
+        # Scan from end to find most recent reads
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if content.startswith("OK: read ") or content.startswith("OK: wrote "):
+                    # Extract path from observation
+                    parts = content.split()
+                    if len(parts) >= 3:
+                        read_paths.add(parts[2])
+                elif content.startswith("FILE: "):
+                    # From get_context output
+                    path = content.split("\n")[0].replace("FILE: ", "").strip()
+                    read_paths.add(path)
+        
+        # Compress older reads that are superseded
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if "FILE:" in content and len(content) > 500:
+                    # Extract filename from context block
+                    first_line = content.split("\n")[0]
+                    if "FILE:" in first_line:
+                        path = first_line.replace("FILE: ", "").replace("=", "").strip()
+                        if path in read_paths:
+                            msg["content"] = f"[Previously read: {path}]"
     
     def _execute_action(
         self,
@@ -1156,8 +1163,9 @@ class Orchestrator:
             
             # Invalidate knowledge provider cache for this file
             rel_path = str(target.relative_to(project_path))
-            if project_path in self._knowledge_providers:
-                self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
+            project_key = str(project_path)
+            if project_key in self._knowledge_providers:
+                self._knowledge_providers[project_key]._cache.invalidate_file(rel_path)
             
             return f"OK: wrote {len(action.content or '')} chars"
         
@@ -1201,8 +1209,9 @@ class Orchestrator:
             
             # Invalidate knowledge provider cache for this file
             rel_path = str(target.relative_to(project_path))
-            if project_path in self._knowledge_providers:
-                self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
+            project_key = str(project_path)
+            if project_key in self._knowledge_providers:
+                self._knowledge_providers[project_key]._cache.invalidate_file(rel_path)
             
             return f"OK: patched {len(old_text)} → {len(new_text)} chars"
         
@@ -1263,10 +1272,11 @@ class Orchestrator:
                 results.append(f"{patch['path']}: {len(old_text)} → {len(new_text)}")
             
             # Invalidate knowledge provider cache for all patched files
-            if project_path in self._knowledge_providers:
+            project_key = str(project_path)
+            if project_key in self._knowledge_providers:
                 for patch in patches:
                     rel_path = patch["path"]
-                    self._knowledge_providers[project_path]._cache.invalidate_file(rel_path)
+                    self._knowledge_providers[project_key]._cache.invalidate_file(rel_path)
             
             return "OK: " + "; ".join(results)
         
@@ -1276,13 +1286,14 @@ class Orchestrator:
                 return "ERROR: find_references requires path (the symbol to search for)"
             
             # Get or create knowledge provider for this project
-            if project_path not in self._knowledge_providers:
-                if project_path not in self._index_cache:
-                    self._index_cache[project_path] = Indexer(project_path)
-                    self._index_cache[project_path].build()
-                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
+            project_key = str(project_path)
+            if project_key not in self._knowledge_providers:
+                if project_key not in self._index_cache:
+                    self._index_cache[project_key] = Indexer(project_path)
+                    self._index_cache[project_key].build()
+                self._knowledge_providers[project_key] = KnowledgeProvider(self._index_cache[project_key])
             
-            provider = self._knowledge_providers[project_path]
+            provider = self._knowledge_providers[project_key]
             results = provider.find_references(action.path)
             
             if not results:
@@ -1304,13 +1315,14 @@ class Orchestrator:
                 return "ERROR: find_definition requires path"
             
             # Get or create knowledge provider for this project
-            if project_path not in self._knowledge_providers:
-                if project_path not in self._index_cache:
-                    self._index_cache[project_path] = Indexer(project_path)
-                    self._index_cache[project_path].build()
-                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
+            project_key = str(project_path)
+            if project_key not in self._knowledge_providers:
+                if project_key not in self._index_cache:
+                    self._index_cache[project_key] = Indexer(project_path)
+                    self._index_cache[project_key].build()
+                self._knowledge_providers[project_key] = KnowledgeProvider(self._index_cache[project_key])
             
-            provider = self._knowledge_providers[project_path]
+            provider = self._knowledge_providers[project_key]
             results = provider.find_definition(action.path)
             
             if not results:
@@ -1328,13 +1340,14 @@ class Orchestrator:
                 return "ERROR: find_importers requires path"
             
             # Get or create knowledge provider for this project
-            if project_path not in self._knowledge_providers:
-                if project_path not in self._index_cache:
-                    self._index_cache[project_path] = Indexer(project_path)
-                    self._index_cache[project_path].build()
-                self._knowledge_providers[project_path] = KnowledgeProvider(self._index_cache[project_path])
+            project_key = str(project_path)
+            if project_key not in self._knowledge_providers:
+                if project_key not in self._index_cache:
+                    self._index_cache[project_key] = Indexer(project_path)
+                    self._index_cache[project_key].build()
+                self._knowledge_providers[project_key] = KnowledgeProvider(self._index_cache[project_key])
             
-            provider = self._knowledge_providers[project_path]
+            provider = self._knowledge_providers[project_key]
             results = provider.find_importers(action.path)
             
             if not results:
@@ -1352,11 +1365,12 @@ class Orchestrator:
                 return "ERROR: find_tests requires path"
             
             # Get or create indexer for this project
-            if project_path not in self._index_cache:
-                self._index_cache[project_path] = Indexer(project_path)
-                self._index_cache[project_path].build()
+            project_key = str(project_path)
+            if project_key not in self._index_cache:
+                self._index_cache[project_key] = Indexer(project_path)
+                self._index_cache[project_key].build()
             
-            indexer = self._index_cache[project_path]
+            indexer = self._index_cache[project_key]
             results = indexer.find_tests(action.path)
             
             if not results:
@@ -1378,11 +1392,12 @@ class Orchestrator:
                 return f"ERROR: file not found: {action.path}"
             
             # Get or create indexer for this project
-            if project_path not in self._index_cache:
-                self._index_cache[project_path] = Indexer(project_path)
-                self._index_cache[project_path].build()
+            project_key = str(project_path)
+            if project_key not in self._index_cache:
+                self._index_cache[project_key] = Indexer(project_path)
+                self._index_cache[project_key].build()
             
-            indexer = self._index_cache[project_path]
+            indexer = self._index_cache[project_key]
             rel = str(target.relative_to(project_path))
             
             if rel not in indexer.files:

@@ -3,8 +3,7 @@
 AI receives task + context, outputs JSON actions.
 No exploration, no planning, no self-review.
 
-Note: build_prompt() is a standalone utility. The orchestrator uses
-DEFAULT_PROMPT_TEMPLATES in orchestrator.py instead.
+Canonical action taxonomy - single source of truth for both standalone and orchestrated modes.
 """
 
 import json
@@ -13,13 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Standalone prompt - orchestrator uses DEFAULT_PROMPT_TEMPLATES instead
+# Canonical action taxonomy - single source of truth
+# Both standalone and orchestrated modes use this prompt
 SYSTEM_PROMPT = """You are a coding assistant. Complete tasks by taking actions.
 
 Actions (respond with JSON):
 {"reasoning": "why", "action": "read", "path": "file"}
 {"reasoning": "why", "action": "write", "path": "file", "content": "..."}
 {"reasoning": "why", "action": "apply_patch", "path": "file", "content": "old_text", "result": "new_text"}
+{"reasoning": "why", "action": "apply_multi_patch", "path": "files", "content": "[{\"path\": \"f\", \"old_text\": \"...\", \"new_text\": \"...\"}]"}
 {"reasoning": "why", "action": "execute", "command": "shell command"}
 {"reasoning": "why", "action": "final", "result": "summary"}
 {"reasoning": "why", "action": "list"}
@@ -27,15 +28,20 @@ Actions (respond with JSON):
 {"reasoning": "why", "action": "find_references", "path": "symbol_name"}
 {"reasoning": "why", "action": "find_definition", "path": "symbol_name"}
 {"reasoning": "why", "action": "find_importers", "path": "module_name"}
+{"reasoning": "why", "action": "find_tests", "path": "symbol_name"}
+{"reasoning": "why", "action": "find_imports", "path": "file_path"}
 
 Rules:
 - Read before write (overwrites existing)
 - apply_patch: use for targeted edits; must match old_text exactly
-- Execute runs in project folder
+- apply_multi_patch: atomic multi-file patch; all must validate or all rejected
+- Execute runs in project folder (opt-in, off by default)
 - Call final when task complete
 - find_references: find files that define or reference a symbol
 - find_definition: find files that define a specific symbol
-- find_importers: find files that import a specific module"""
+- find_importers: find files that import a specific module
+- find_tests: find test files related to a symbol
+- find_imports: show imports within a specific file"""
 
 
 @dataclass

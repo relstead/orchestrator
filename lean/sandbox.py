@@ -28,6 +28,10 @@ DANGEROUS_PATTERNS = [
 DANGEROUS_RE = re.compile("|".join(DANGEROUS_PATTERNS), re.IGNORECASE)
 
 
+# Cache for bubblewrap availability check (per process)
+_BWRAP_AVAILABLE: bool | None = None
+
+
 @dataclass
 class ExecutionResult:
     """Result of command execution."""
@@ -43,16 +47,21 @@ def is_dangerous(command: str) -> bool:
 
 
 def _check_bubblewrap() -> bool:
-    """Check if bubblewrap is available and can run.
+    """Check if bubblewrap is available and can run (cached per process).
     
     Note: bubblewrap requires user namespace capabilities which may not be
     available in all container environments.
     """
+    global _BWRAP_AVAILABLE
+    if _BWRAP_AVAILABLE is not None:
+        return _BWRAP_AVAILABLE
+    
     bubblewrap_path = subprocess.run(
         ["which", "bwrap"], capture_output=True, text=True
     ).stdout.strip()
     
     if not (bubblewrap_path and os.path.exists(bubblewrap_path)):
+        _BWRAP_AVAILABLE = False
         return False
     
     # Quick sanity check: try running bwrap with a trivial command
@@ -63,8 +72,10 @@ def _check_bubblewrap() -> bool:
             capture_output=True,
             timeout=5,
         )
-        return result.returncode == 0
+        _BWRAP_AVAILABLE = (result.returncode == 0)
+        return _BWRAP_AVAILABLE
     except Exception:
+        _BWRAP_AVAILABLE = False
         return False
 
 

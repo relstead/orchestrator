@@ -29,6 +29,19 @@ def safe_vault_path(vault_root: Path, relative: str) -> Path:
     return candidate
 
 
+def safe_project_path(project_path: Path, relative: str) -> Path:
+    """
+    Resolve a path relative to the project, rejecting paths that escape.
+    
+    Used for write actions that should be confined to the project directory.
+    """
+    project_resolved = project_path.resolve()
+    candidate = (project_resolved / relative).resolve()
+    if project_resolved not in candidate.parents and candidate != project_resolved:
+        raise VaultAccessError(f"Refused path outside project: {relative}")
+    return candidate
+
+
 def sanitize_project_name(name: str) -> str:
     """Remove invalid characters from a project name."""
     name = PROJECT_NAME_RE.sub("", name).strip()

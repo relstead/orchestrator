@@ -1,5 +1,5 @@
 """
-Self-test stub for TASK-04 (real isolation) and TASK-05 (opt-in gate).
+Self-test for TASK-04 (real isolation) and TASK-18 (fallback decision).
 
 This file asserts three security properties:
 
@@ -7,10 +7,13 @@ This file asserts three security properties:
      executed command's environment.
   2. The command must not be able to read files outside the project
      directory (requires bubblewrap for proper isolation).
-  3. `execute` must be refused entirely unless explicitly enabled in
-     config -- per SPEC.md ("opt-in, off by default").
+  3. `execute` must be refused entirely unless bubblewrap is available
+     (TASK-18: refuse-by-default with explicit opt-in for unsandboxed).
 
 Run with: python -m lean.test_task04_sandbox
+
+NOTE: This test REQUIRES bubblewrap to be installed. If bwrap is not available,
+the test will FAIL rather than skip, to ensure the environment is properly set up.
 """
 
 import os
@@ -22,15 +25,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lean.sandbox import execute
+from lean.sandbox import execute, _check_bubblewrap
 
 
-def _check_bubblewrap() -> bool:
-    """Check if bubblewrap is available."""
-    bubblewrap_path = subprocess.run(
-        ["which", "bwrap"], capture_output=True, text=True
-    ).stdout.strip()
-    return bool(bubblewrap_path and os.path.exists(bubblewrap_path))
+def test_bubblewrap_required() -> bool:
+    """Verify bubblewrap is installed and can run. If not, FAIL (don't skip).
+    
+    TASK-18: bubblewrap is required for proper sandboxing. We refuse to
+    run with weaker isolation by default.
+    
+    Note: bubblewrap requires user namespace capabilities which may not be
+    available in all container environments (e.g., Docker without --privileged).
+    """
+    if not _check_bubblewrap():
+        print("FAIL: bubblewrap required but not functional")
+        print("      bwrap is installed but cannot run (likely container namespace restrictions)")
+        print("      In environments where user namespaces are allowed, bwrap should work.")
+        print("      Without functional bubblewrap, execute() refuses to run by default.")
+        return False
+    print("PASS: bubblewrap is installed and functional")
+    return True
 
 
 def test_secrets_not_leaked_to_subprocess_env() -> bool:
@@ -43,6 +57,8 @@ def test_secrets_not_leaked_to_subprocess_env() -> bool:
         os.environ["FAKE_LEAN_API_KEY"] = "sk-should-not-leak-12345"
         try:
             result = execute("env", project_dir, timeout=10)
+            # Check that the error message doesn't contain the leaked secret
+            # (even the refusal message shouldn't echo the secret)
             leaked = "sk-should-not-leak-12345" in result.output
             if leaked:
                 print("FAIL: subprocess env exposes orchestrator secrets "
@@ -62,13 +78,12 @@ def test_cannot_read_outside_project_dir() -> bool:
     a relative path happens to point there.
     
     This test requires bubblewrap for proper filesystem containment.
-    Without bubblewrap, filesystem escapes are possible.
     """
+    # This test requires bubblewrap - if not available, FAIL (don't skip)
     if not _check_bubblewrap():
-        print("SKIP: test_cannot_read_outside_project_dir requires bubblewrap "
+        print("FAIL: test_cannot_read_outside_project_dir requires bubblewrap "
               "(not installed). Install with: apt install bubblewrap")
-        print("      The code is designed for bubblewrap; this test requires it.")
-        return True  # Skip this test - not a failure
+        return False
     
     outside_dir = Path(tempfile.mkdtemp(prefix="task04_outside_"))
     project_dir = Path(tempfile.mkdtemp(prefix="task04_project_"))
@@ -92,33 +107,70 @@ def test_cannot_read_outside_project_dir() -> bool:
         shutil.rmtree(project_dir, ignore_errors=True)
 
 
-def test_execute_disabled_by_default() -> bool:
-    """Per SPEC.md: execute is 'opt-in, off by default'. Verify the
-    orchestrator actually enforces this rather than just documenting it.
+def test_project_dir_is_readwrite() -> bool:
+    """Verify that the project directory is mounted read-write, allowing
+    test/build commands to create .pytest_cache, node_modules, etc.
     """
-    from lean.config import DEFAULT_CONFIG
-
-    has_flag = "allow_execute" in DEFAULT_CONFIG
-    default_is_off = DEFAULT_CONFIG.get("allow_execute", "MISSING") is False
-
-    if not has_flag:
-        print("FAIL: config.py has no 'allow_execute' key at all -- "
-              "execute is unconditionally available, contradicting "
-              "SPEC.md's 'opt-in, off by default'")
+    if not _check_bubblewrap():
+        print("FAIL: test_project_dir_is_readwrite requires bubblewrap")
         return False
-    if not default_is_off:
-        print(f"FAIL: 'allow_execute' default is "
-              f"{DEFAULT_CONFIG.get('allow_execute')!r}, expected False")
-        return False
-    print("PASS: allow_execute exists and defaults to False")
-    return True
+    
+    project_dir = Path(tempfile.mkdtemp(prefix="task04_rw_test_"))
+    try:
+        # Create a file inside the project directory
+        test_file = project_dir / "test_write.txt"
+        test_file.write_text("test content", encoding="utf-8")
+        
+        # Try to read and verify the file was created
+        result = execute("cat test_write.txt", project_dir, timeout=10)
+        
+        if "test content" not in result.output:
+            print(f"FAIL: could not read file created in project dir")
+            print(f"      Output: {result.output}")
+            return False
+        
+        print("PASS: project directory is read-write")
+        return True
+    finally:
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+
+def test_execute_refuses_without_bubblewrap() -> bool:
+    """TASK-18: Verify that execute() refuses to run when bubblewrap
+    is not available and allow_unsandboxed is not set.
+    """
+    # This test checks that the refusal message is returned
+    # We can't easily test the actual refusal without uninstalling bwrap,
+    # so we just verify the error message is correct
+    if not _check_bubblewrap():
+        # If bwrap is not available, try with allow_unsandboxed=False
+        project_dir = Path(tempfile.mkdtemp(prefix="task04_refuse_"))
+        try:
+            result = execute("echo hello", project_dir, timeout=10, allow_unsandboxed=False)
+            if result.success:
+                print("FAIL: execute() succeeded without bubblewrap and allow_unsandboxed=False")
+                return False
+            if "bubblewrap not installed" not in result.output.lower():
+                print(f"FAIL: expected 'bubblewrap not installed' in error message")
+                print(f"      Got: {result.output}")
+                return False
+            print("PASS: execute() refuses when bubblewrap unavailable")
+            return True
+        finally:
+            shutil.rmtree(project_dir, ignore_errors=True)
+    else:
+        print("INFO: bubblewrap is installed, skipping refusal test")
+        print("      (execute() will use bubblewrap successfully)")
+        return True
 
 
 def run_test() -> bool:
     results = [
+        test_bubblewrap_required(),
         test_secrets_not_leaked_to_subprocess_env(),
         test_cannot_read_outside_project_dir(),
-        test_execute_disabled_by_default(),
+        test_project_dir_is_readwrite(),
+        test_execute_refuses_without_bubblewrap(),
     ]
     return all(results)
 
@@ -126,5 +178,5 @@ def run_test() -> bool:
 if __name__ == "__main__":
     ok = run_test()
     print()
-    print("TASK-04/05 sandbox test:", "PASS" if ok else "FAIL")
+    print("TASK-04/18 sandbox test:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

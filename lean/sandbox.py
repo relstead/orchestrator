@@ -1,11 +1,9 @@
 """Sandboxed command execution.
 
-Executes commands with real isolation using:
-1. bubblewrap (preferred) for filesystem and network isolation
-2. unshare-based fallback for namespace isolation
-3. Environment variable allowlisting to prevent API key leakage
+Executes commands with real isolation using bubblewrap for filesystem and network isolation.
+Environment variables are allowlisted to prevent API key leakage.
 
-Filesystem view is limited to the project directory only.
+Filesystem view is limited to the project directory only (read-write) plus system directories (read-only).
 Network access is disabled by default.
 """
 
@@ -45,11 +43,29 @@ def is_dangerous(command: str) -> bool:
 
 
 def _check_bubblewrap() -> bool:
-    """Check if bubblewrap is available."""
+    """Check if bubblewrap is available and can run.
+    
+    Note: bubblewrap requires user namespace capabilities which may not be
+    available in all container environments.
+    """
     bubblewrap_path = subprocess.run(
         ["which", "bwrap"], capture_output=True, text=True
     ).stdout.strip()
-    return bool(bubblewrap_path and os.path.exists(bubblewrap_path))
+    
+    if not (bubblewrap_path and os.path.exists(bubblewrap_path)):
+        return False
+    
+    # Quick sanity check: try running bwrap with a trivial command
+    # If user namespaces aren't allowed, this will fail
+    try:
+        result = subprocess.run(
+            ["bwrap", "--bind", "/tmp", "/tmp", "true"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def execute(
@@ -58,15 +74,27 @@ def execute(
     timeout: int = 30,
     max_output: int = 3000,
     allow_network: bool = False,
+    allow_unsandboxed: bool = False,
 ) -> ExecutionResult:
     """
     Execute command in sandboxed environment.
     
     Security features:
-    - Filesystem view limited to project directory (with bubblewrap)
+    - Filesystem view limited to project directory (read-write) plus system dirs (read-only)
     - Network disabled by default (allow_network=True to enable)
     - Environment variables cleared except safe allowlist
-    - Process/mount/IPC/UTS namespaces isolated
+    - Process/PID/IPC/UTS namespaces isolated
+    
+    Args:
+        command: The shell command to execute
+        cwd: Working directory (project path)
+        timeout: Max execution time in seconds
+        max_output: Max output characters to return
+        allow_network: Whether to allow network access
+        allow_unsandboxed: If True, allow execution without bubblewrap (not recommended)
+    
+    Returns:
+        ExecutionResult with success, exit_code, output, and timed_out fields
     """
     if not command.strip():
         return ExecutionResult(success=False, exit_code=-1, output="ERROR: empty command", timed_out=False)
@@ -86,17 +114,25 @@ def execute(
     }
     
     try:
-        # Try bubblewrap first (best containment)
+        # Bubblewrap is required for proper filesystem containment
         if _check_bubblewrap():
             return _execute_with_bubblewrap(
                 command, project_path, timeout, max_output, allow_network, safe_env
             )
         
-        # Fallback: basic isolation (limited without root/bubblewrap)
-        # We can't fully restrict filesystem access without a proper sandbox,
-        # but we prevent API key leakage by clearing the environment
-        return _execute_basic_isolation(
-            command, project_path, timeout, max_output, safe_env
+        # No sandbox available - refuse to run unless explicitly opted in
+        if allow_unsandboxed:
+            return _execute_basic_isolation(
+                command, project_path, timeout, max_output, safe_env
+            )
+        
+        return ExecutionResult(
+            success=False,
+            exit_code=-1,
+            output="REFUSED: bubblewrap not installed, cannot provide filesystem isolation. "
+                   "Install bubblewrap: apt install bubblewrap. "
+                   "Or set allow_unsandboxed=True to run without isolation.",
+            timed_out=False,
         )
     
     except subprocess.TimeoutExpired:
@@ -125,22 +161,22 @@ def _execute_with_bubblewrap(
         "--unshare-uts",          # New UTS namespace (hostname)
         "--unshare-ipc",          # New IPC namespace
         "--die-with-parent",      # Kill child if parent dies
-        "--clear-env",            # Clear all env vars
+        "--clearenv",             # Clear all env vars (correct flag name)
     ]
     
     if not allow_network:
         bwrap_cmd.append("--unshare-net")  # No network access
     
     # Filesystem isolation: create a minimal view
-    # /tmp is a tmpfs
-    # /dev is minimal
-    # /proc is mounted
-    # Only the project directory is accessible (bind-mounted read-only)
+    # Bind system directories read-only so shell/interpreter can execute
+    # Project directory is read-write so tests/builds can write (.pytest_cache, node_modules, etc.)
     bwrap_cmd.extend([
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/bin", "/bin",
         "--tmpfs", "/tmp",
-        "--dev", "/dev/null",
+        "--dev-bind", "/dev/null", "/dev/null",
         "--proc", "/proc",
-        "--ro-bind", project_str, project_str,
+        "--bind", project_str, project_str,  # Read-write for project dir
     ])
     
     # Add only safe environment variables
@@ -179,13 +215,15 @@ def _execute_basic_isolation(
     safe_env: dict[str, str],
 ) -> ExecutionResult:
     """
-    Basic isolation without bubblewrap.
+    Basic isolation without bubblewrap (opt-in only).
     
-    Note: This cannot fully restrict filesystem access without proper sandboxing
-    tools (bubblewrap, firejail, etc.) or root privileges. It primarily prevents
-    API key leakage by clearing environment variables.
+    WARNING: This provides NO real filesystem containment. Only use this if:
+    1. You explicitly opt-in with allow_unsandboxed=True
+    2. You understand that executed commands can read/write ANY file on the system
     
-    For production use, install bubblewrap: apt install bubblewrap
+    This function exists only to support environments where bubblewrap cannot be installed.
+    It prevents API key leakage by clearing environment variables, but does not
+    restrict filesystem access at all.
     """
     # Check if we can use unshare for basic namespace isolation
     unshare_available = subprocess.run(

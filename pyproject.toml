@@ -1,0 +1,13 @@
+[project]
+name = "lean"
+version = "0.1.0"
+description = "Vault Orchestrator - Windows-native sandboxed AI task runner"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+lean = "lean.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

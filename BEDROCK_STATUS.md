@@ -6,7 +6,8 @@ This document tracks the completion state of the Vault Orchestrator implementati
 
 **Phase 1 (Bedrock Validation)**: ✅ Complete  
 **Phase 2 (Fill Critical Gaps)**: ✅ Complete  
-**Phase 3 (Priming for Internals)**: ✅ Complete
+**Phase 3 (Priming for Internals)**: ✅ Complete  
+**v1.0 (Internals)**: ✅ Complete
 
 ## Build Order (§0.5)
 
@@ -31,11 +32,14 @@ This document tracks the completion state of the Vault Orchestrator implementati
 | agent.py | ✅ | Action parsing, string-aware JSON extraction |
 | sandbox.py | ✅ | All sandbox primitives + ACLSetup |
 | logger.py | ✅ | MetricsWriter, DigestWriter with compaction |
-| worker.py | ✅ | WorkerPool with rate limiting |
+| worker.py | ✅ | WorkerPool + task execution |
 | planner.py | ✅ | Plan validation (no provider calls) |
 | verification.py | ✅ | Task/project verification |
 | orchestrator.py | ✅ | Main loop, dispatch, snapshot, changeset |
 | cli.py | ✅ | init, run, status, add commands |
+| **provider.py** | ✅ | HTTP client for Groq/OpenRouter APIs |
+| **agent_loop.py** | ✅ | Turn execution, transcript management |
+| **dispatcher.py** | ✅ | Action dispatch, path validation |
 
 ## Self-Test Results
 
@@ -107,16 +111,14 @@ This document tracks the completion state of the Vault Orchestrator implementati
 ### Inbox Decomposition
 - Uses simple parser, not model-driven decomposition
 
-## What Remains (Internals Work)
+## What Remains (v1.1)
 
-The following are **not yet implemented** - these are the "internals" that require provider integration and AI dispatch:
+The following are **nice to have** for v1.1:
 
-1. **Agent Loop**: Full turn execution, LLM calls, action dispatch
-2. **Provider Integration**: HTTP client for Groq/OpenRouter/etc.
-3. **Real Sandbox Spawn**: AppContainer process creation with SECURITY_CAPABILITIES
-4. **Task Transcript**: Full transcript management during task execution
-5. **Rollback on Crash**: Recovery from crashes mid-task
+1. **Real Sandbox Spawn**: Complete AppContainer spawn with SECURITY_CAPABILITIES
+2. **Model-Driven Inbox Decomposition**: Uses simple parser, not model
+3. **Async Task Execution**: Spawn worker threads instead of blocking poll cycle
 
-## Getting Started with Internals
+## Getting Started
 
-See [INTERNALS_CONTRACT.md](./INTERNALS_CONTRACT.md) for the interface contract between bedrock and internals.
+See [INTERNALS_CONTRACT.md](./INTERNALS_CONTRACT.md) for the interface contract.

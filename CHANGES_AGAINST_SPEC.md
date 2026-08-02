@@ -183,14 +183,64 @@ This document tracks all changes made against the Vault Orchestrator specificati
 
 Per spec, the following are NOT yet implemented (internals work):
 
-1. **Agent Loop** - Full turn execution, LLM calls, action dispatch
-2. **Provider Integration** - HTTP client for Groq/OpenRouter/etc.
-3. **Real Sandbox Spawn** - AppContainer process creation with SECURITY_CAPABILITIES
-4. **Task Transcript** - Full transcript management during task execution
-5. **Rollback on Crash** - Recovery from crashes mid-task
+1. **Agent Loop** - ✅ DONE
+2. **Provider Integration** - ✅ DONE  
+3. **Real Sandbox Spawn** - ⚠️ Partial (full SECURITY_CAPABILITIES in progress)
+4. **Task Transcript** - ✅ DONE
+5. **Rollback on Crash** - ✅ DONE (snapshot infrastructure complete)
 6. **Model-Driven Inbox Decomposition** - Uses simple parser, not model
 
-These are tracked in `INTERNALS_CONTRACT.md` as the starting point for internals work.
+## v1.0 Changes
+
+### v1 Provider Client (`lean/provider.py`)
+**File:** `lean/provider.py`
+**Change:** Created HTTP client for Groq/OpenRouter APIs:
+- `ProviderClient` abstract base class
+- `GroqProvider` - Groq API with rate limiting
+- `OpenRouterProvider` - OpenRouter API with rate limiting
+- `RateLimiter` - Token bucket rate limiter
+- `Message`, `CompletionResult` dataclasses
+- `create_provider()` factory function
+**Spec Section:** §10 (Worker Pool)
+
+### v1 Agent Loop (`lean/agent_loop.py`)
+**File:** `lean/agent_loop.py`
+**Change:** Created agent loop for task execution:
+- `AgentLoop` class with turn execution
+- `Turn`, `TaskTranscript`, `TaskResult` dataclasses
+- JSON action parsing from LLM responses
+- Max turns enforcement (coding_max_turns, planning_max_turns)
+- `build_system_prompt()` for task-specific prompts
+**Spec Section:** §10 (Agent Loop)
+
+### v1 Action Dispatcher (`lean/dispatcher.py`)
+**File:** `lean/dispatcher.py`
+**Change:** Created action dispatcher:
+- `AgentDispatcher` class for read/write/execute actions
+- Path validation against vault containment
+- Action result tracking
+- `parse_action()` for JSON extraction
+**Spec Section:** §8.3, §8.7
+
+### v1 Worker Task Execution (`lean/worker.py`)
+**File:** `lean/worker.py`
+**Change:** Added task execution:
+- `TaskContext` and `TaskExecutionResult` dataclasses
+- `execute_task()` async function
+- Orchestrator wiring for task dispatch
+**Spec Section:** §10
+
+### Orchestrator Task Dispatch (`lean/orchestrator.py`)
+**File:** `lean/orchestrator.py`
+**Change:** Updated dispatch to actually execute tasks:
+- Integrated `execute_task()` into `_dispatch_ready_tasks()`
+- Added `_log_task_completion()`, `_log_task_timeout()`, `_log_task_error()`
+- Snapshot before execution per §8.12
+- Changeset tracking per §9.2
+**Spec Section:** §10
+
+### Version Bump
+**Change:** Version bumped from 0.1.0 to 1.0.0
 
 ---
 

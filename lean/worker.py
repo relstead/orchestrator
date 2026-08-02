@@ -192,3 +192,117 @@ class WorkerPool:
                 for w in self._workers.values()
             ],
         }
+
+
+# =============================================================================
+# Task Execution - Per §10
+# =============================================================================
+
+@dataclass
+class TaskContext:
+    """Context for task execution."""
+    task_id: str
+    project: str
+    task_type: str
+    title: str
+    body: str
+    attempt: int
+    vault_root: Path
+    changed_paths: dict[str, dict]
+
+
+@dataclass
+class TaskExecutionResult:
+    """Result of task execution."""
+    outcome: str  # done, timeout, error, failed
+    turns_used: int
+    actions: list[dict]
+    transcript: dict
+    error: str | None = None
+
+
+async def execute_task(
+    context: TaskContext,
+    config: "Config",
+) -> TaskExecutionResult:
+    """
+    Execute a single task.
+    
+    1. Create provider client
+    2. Build agent loop
+    3. Execute turns
+    4. Dispatch actions
+    5. Return result
+    """
+    from .provider import create_provider, Message
+    from .agent_loop import AgentLoop, build_system_prompt, TaskResult
+    from .dispatcher import AgentDispatcher
+    from .vault import open_vault
+    
+    # Get available worker
+    pool = WorkerPool(config)
+    worker = pool.get_available_worker(context.task_type)
+    
+    if not worker:
+        return TaskExecutionResult(
+            outcome="failed",
+            turns_used=0,
+            actions=[],
+            transcript={},
+            error="No available worker for task type",
+        )
+    
+    # Create provider
+    provider = create_provider(
+        provider_type="groq",  # Default, could be configurable
+        api_key=worker.api_key or "",
+        model=worker.model,
+        base_url=worker.base_url,
+    )
+    
+    try:
+        # Open vault
+        vault = open_vault(context.vault_root)
+        
+        # Create dispatcher
+        dispatcher = AgentDispatcher(vault=vault, config=config)
+        
+        # Build system prompt
+        system_prompt = build_system_prompt(context.task_type, config)
+        
+        # Build initial message with context
+        initial_message = f"# Task: {context.title}\n\n{context.body}"
+        
+        # Add changed paths from previous attempts
+        if context.changed_paths:
+            initial_message += "\n\n## Files from previous attempts:\n"
+            for path, info in context.changed_paths.items():
+                initial_message += f"- {path} ({info.get('status', 'unknown')})\n"
+        
+        # Create agent loop
+        agent = AgentLoop(
+            provider=provider,
+            config=config,
+            task_id=context.task_id,
+            task_type=context.task_type,
+            system_prompt=system_prompt,
+        )
+        
+        # Run agent loop
+        task_result: TaskResult = await agent.run(initial_message)
+        
+        # Dispatch actions from transcript
+        for turn in agent.transcript.turns:
+            for action in turn.actions:
+                dispatcher.dispatch(action, context.task_type)
+        
+        return TaskExecutionResult(
+            outcome=task_result.outcome,
+            turns_used=len(agent.transcript.turns),
+            actions=task_result.actions_taken,
+            transcript=agent.transcript.to_json(),
+            error=task_result.error,
+        )
+    
+    finally:
+        await provider.close()

@@ -382,7 +382,9 @@ class Orchestrator:
     
     def _dispatch_ready_tasks(self) -> None:
         """Dispatch ready tasks to available workers."""
+        import asyncio
         from .tasks import TaskState
+        from .worker import execute_task, TaskContext
         
         for project in self._vault.discover_projects():
             # Get ready tasks from dependency graph
@@ -397,9 +399,48 @@ class Orchestrator:
                     self._task_store.move_task(task, TaskState.DOING)
                     self._workers.mark_used(worker.name)
                     
-                    # In real impl, would spawn worker thread
-                    # For now, just log
-                    print(f"Would dispatch task {task.id} to {worker.name}")
+                    # Build task context
+                    project_path = self._vault.get_project_path(project)
+                    changeset = self.load_changeset(task.id)
+                    
+                    context = TaskContext(
+                        task_id=task.id,
+                        project=project,
+                        task_type=task.meta.type.value,
+                        title=task.title,
+                        body=task.body,
+                        attempt=task.meta.attempts,
+                        vault_root=self._vault_path,
+                        changed_paths=changeset,
+                    )
+                    
+                    # Take snapshot before execution (per §8.12)
+                    self.ensure_snapshot(task.id, task.meta.attempts, project_path)
+                    
+                    # Execute task synchronously in this poll cycle
+                    # For async execution, would spawn a thread/task
+                    result = asyncio.run(execute_task(context, self._config))
+                    
+                    # Handle result
+                    if result.outcome == "done":
+                        self._task_store.move_task(task, TaskState.DONE)
+                        self._log_task_completion(task, result)
+                    elif result.outcome == "timeout":
+                        # Move to waiting for retry
+                        self._task_store.move_task(task, TaskState.WAITING)
+                        self._log_task_timeout(task, result)
+                    else:
+                        # Error or failed - move to failed or retry
+                        if task.meta.attempts >= self._config.budgets.max_attempts:
+                            self._task_store.move_task(task, TaskState.FAILED)
+                        else:
+                            self._task_store.move_task(task, TaskState.WAITING)
+                        self._log_task_error(task, result)
+                    
+                    # Save changeset
+                    self.save_changeset(task.id)
+                    
+                    print(f"Task {task.id}: {result.outcome} ({result.turns_used} turns)")
                     
                 except Exception as e:
                     print(f"Failed to dispatch task {task.id}: {e}")
@@ -566,6 +607,56 @@ class Orchestrator:
         
         with open(changeset_path) as f:
             return json.load(f)
+    
+    # =========================================================================
+    # Task Logging - Per §8.10
+    # =========================================================================
+    
+    def _log_task_completion(self, task: "Task", result: "TaskExecutionResult") -> None:
+        """Log successful task completion."""
+        from .logger import TaskEvent
+        
+        # Append metrics event
+        event = TaskEvent.create(
+            task_id=task.id,
+            task_type=task.meta.type.value,
+            turns_used=result.turns_used,
+            max_turns=self._config.budgets.coding_max_turns if task.meta.type.value == "coding" else self._config.budgets.planning_max_turns,
+            outcome="done",
+            files_touched=len(result.actions),
+            changeset_from_attempt=task.meta.attempts,
+        )
+        self._metrics.append(event)
+    
+    def _log_task_timeout(self, task: "Task", result: "TaskExecutionResult") -> None:
+        """Log task timeout."""
+        from .logger import TaskEvent
+        
+        event = TaskEvent.create(
+            task_id=task.id,
+            task_type=task.meta.type.value,
+            turns_used=result.turns_used,
+            max_turns=self._config.budgets.coding_max_turns if task.meta.type.value == "coding" else self._config.budgets.planning_max_turns,
+            outcome="timeout",
+            files_touched=len(result.actions),
+            changeset_from_attempt=task.meta.attempts,
+        )
+        self._metrics.append(event)
+    
+    def _log_task_error(self, task: "Task", result: "TaskExecutionResult") -> None:
+        """Log task error."""
+        from .logger import TaskEvent
+        
+        event = TaskEvent.create(
+            task_id=task.id,
+            task_type=task.meta.type.value,
+            turns_used=result.turns_used,
+            max_turns=self._config.budgets.coding_max_turns if task.meta.type.value == "coding" else self._config.budgets.planning_max_turns,
+            outcome="error",
+            files_touched=len(result.actions),
+            changeset_from_attempt=task.meta.attempts,
+        )
+        self._metrics.append(event)
     
     # =========================================================================
     # Output Compression - §8.9

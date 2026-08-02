@@ -284,17 +284,18 @@ class Orchestrator:
         """
         items = []
         current_item = None
+        line_idx = 0
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
         
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        while line_idx < len(lines):
+            line = lines[line_idx]
             
             # Check for separator
             if line.startswith("---"):
                 if current_item and current_item.get("title"):
                     items.append(current_item)
                 current_item = None
+                line_idx += 1
                 continue
             
             # Check for project prefix
@@ -306,20 +307,29 @@ class Orchestrator:
                 project = line[1:line.index(":")]
                 line = line[line.index(":") + 1:].strip()
             
-            if current_item is None:
-                current_item = {"project": project, "title": "", "body": ""}
-            elif not current_item["title"]:
-                current_item["title"] = line
-                current_item["project"] = project or current_item.get("project")
-            else:
-                # Body content
-                if current_item["body"]:
-                    current_item["body"] += "\n" + line
-                else:
-                    current_item["body"] = line
-        
-        # Don't forget last item
-        if current_item and current_item.get("title"):
+            # Start new item with title
+            title = line
+            body_lines = []
+            line_idx += 1
+            
+            # Collect body until separator or end
+            while line_idx < len(lines):
+                next_line = lines[line_idx]
+                if next_line.startswith("---"):
+                    break
+                
+                # Check for new task (has project prefix)
+                if next_line.startswith("[") or next_line.startswith("@"):
+                    break
+                
+                body_lines.append(next_line)
+                line_idx += 1
+            
+            current_item = {
+                "project": project,
+                "title": title,
+                "body": "\n".join(body_lines) if body_lines else "",
+            }
             items.append(current_item)
         
         return items

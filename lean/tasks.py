@@ -212,9 +212,10 @@ class TaskStore:
     def __init__(self, vault: "Vault"):
         self._vault = vault
     
-    def get_tasks_in_state(self, project: str, state: TaskState) -> list[Task]:
+    def get_tasks_in_state(self, project: str, state: TaskState | str) -> list[Task]:
         """Get all tasks in a given state for a project."""
-        tasks_dir = self._vault.get_project_path(project) / "tasks" / state.value
+        state_value = state.value if isinstance(state, TaskState) else state
+        tasks_dir = self._vault.get_project_path(project) / "tasks" / state_value
         if not tasks_dir.exists():
             return []
         

@@ -18,6 +18,7 @@ from lean.sandbox import (
     SpawnResult,
     is_command_allowed,
     safe_vault_path,
+    ACLSetup,
 )
 from lean.logger import MetricsWriter, DigestWriter, TaskEvent
 from lean.worker import Worker, WorkerPool
@@ -48,6 +49,7 @@ __all__ = [
     "SpawnResult",
     "is_command_allowed",
     "safe_vault_path",
+    "ACLSetup",
     "MetricsWriter",
     "DigestWriter",
     "TaskEvent",

@@ -1085,6 +1085,236 @@ class AppContainerSandbox:
 
 
 # =============================================================================
+# ACL Setup on Vault Paths - §0.5 Step 4
+# =============================================================================
+
+# Security descriptor constants
+OWNER_SECURITY_INFORMATION = 0x00000001
+DACL_SECURITY_INFORMATION = 0x00000004
+
+# ACL constants
+ACL_REVISION = 2
+ACLI_RESOURCE_ATTRIBUTE_BYTE = 19
+
+# AppContainer well-known SIDs
+APP_CONTAINER_SID_AUTHORITY = (0, 0, 0, 0, 0, 17)  # NT AUTHORITY
+APP_CONTAINER_RID_BASE = 0x1000  # 4096
+
+
+class ACLSetup:
+    """
+    ACL setup for vault paths.
+    
+    Grants AppContainer SID explicit access to vault paths.
+    Per §0.5 Step 4.
+    """
+    
+    _setup_cache: set[str] = set()  # Paths that have been set up
+    
+    @classmethod
+    def is_setup(cls, path: str) -> bool:
+        """Check if ACL has been set up for this path."""
+        return path in cls._setup_cache
+    
+    @classmethod
+    def grant_path_access(
+        cls,
+        path: str,
+        package_sid: bytes,
+        read: bool = True,
+        write: bool = True,
+    ) -> bool:
+        """
+        Grant AppContainer SID access to a path.
+        
+        Uses SetNamedSecurityInfo for DACL modification.
+        
+        Args:
+            path: Path to modify
+            package_sid: AppContainer package SID bytes
+            read: Grant read access
+            write: Grant write access
+        
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not IS_WINDOWS:
+            return True  # No-op on non-Windows
+        
+        try:
+            return cls._grant_access_windows(path, package_sid, read, write)
+        except Exception:
+            return False
+    
+    @classmethod
+    def _grant_access_windows(
+        cls,
+        path: str,
+        package_sid: bytes,
+        read: bool,
+        write: bool,
+    ) -> bool:
+        """Windows implementation of ACL grant."""
+        # Define structures
+        class SID_IDENTIFIER_AUTHORITY(ctypes.Structure):
+            _fields_ = [("Value", ctypes.c_ubyte * 6)]
+        
+        class ACL(ctypes.Structure):
+            _fields_ = [
+                ("AclRevision", ctypes.c_ubyte),
+                ("Sbz1", ctypes.c_ubyte),
+                ("AclSize", ctypes.c_ushort),
+                ("AceCount", ctypes.c_ushort),
+                ("Sbz2", ctypes.c_ushort),
+            ]
+        
+        class ACE_HEADER(ctypes.Structure):
+            _fields_ = [
+                ("AceType", ctypes.c_ubyte),
+                ("AceFlags", ctypes.c_ubyte),
+                ("AceSize", ctypes.c_ushort),
+            ]
+        
+        class ACCESS_ALLOWED_ACE(ctypes.Structure):
+            _fields_ = [
+                ("Header", ACE_HEADER),
+                ("Mask", ctypes.c_ulong),
+                ("SidStart", ctypes.c_ulong),
+            ]
+        
+        # Calculate access mask
+        access_mask = 0
+        if read:
+            access_mask |= GENERIC_READ | FILE_GENERIC_READ
+        if write:
+            access_mask |= GENERIC_WRITE | FILE_GENERIC_WRITE
+        
+        if access_mask == 0:
+            return True  # Nothing to grant
+        
+        # Build ACE
+        ace_size = ctypes.sizeof(ACCESS_ALLOWED_ACE) + len(package_sid) - 4
+        acl_size = ctypes.sizeof(ACL) + ace_size
+        
+        acl_buf = ctypes.create_string_buffer(acl_size)
+        acl = ctypes.cast(acl_buf, ctypes.POINTER(ACL)).contents
+        acl.AclRevision = ACL_REVISION
+        acl.AclSize = acl_size
+        acl.AceCount = 1
+        
+        ace = ctypes.cast(
+            ctypes.byref(acl_buf, ctypes.sizeof(ACL)),
+            ctypes.POINTER(ACCESS_ALLOWED_ACE)
+        ).contents
+        ace.Header.AceType = 0  # ACCESS_ALLOWED_ACE_TYPE
+        ace.Header.AceFlags = 0
+        ace.Header.AceSize = ace_size
+        ace.Mask = access_mask
+        
+        # Copy SID
+        sid_bytes = (ctypes.c_ubyte * len(package_sid)).from_buffer_copy(package_sid)
+        ctypes.memmove(
+            ctypes.addressof(ace.SidStart),
+            sid_bytes,
+            len(package_sid)
+        )
+        
+        # SetNamedSecurityInfo
+        SetNamedSecurityInfo = ctypes.windll.advapi32.SetNamedSecurityInfoW
+        SetNamedSecurityInfo.argtypes = [
+            ctypes.c_wchar_p,  # pObjectName
+            ctypes.c_int,      # SE_OBJECT_TYPE
+            ctypes.c_uint32,   # SecurityInfo
+            ctypes.c_void_p,   # psidOwner
+            ctypes.c_void_p,   # psidGroup
+            ctypes.c_void_p,   # pDacl
+            ctypes.c_void_p,   # pSacl
+        ]
+        SetNamedSecurityInfo.restype = ctypes.c_ulong
+        
+        result = SetNamedSecurityInfo(
+            path,
+            1,  # SE_FILE_OBJECT
+            DACL_SECURITY_INFORMATION,
+            None,  # Owner
+            None,  # Group
+            ctypes.byref(acl),
+            None,  # SACL
+        )
+        
+        return result == 0  # 0 = ERROR_SUCCESS
+    
+    @classmethod
+    def setup_vault_paths(
+        cls,
+        vault_root: Path,
+        package_sid: bytes,
+        discovered_bins: list[Path] | None = None,
+    ) -> bool:
+        """
+        Set up ACLs for the vault.
+        
+        Grants AppContainer SID read/write access to:
+        - Vault root
+        - Projects/*
+        - Skills/
+        - Discovered binary paths
+        
+        Per §0.5 Step 4.
+        """
+        if not IS_WINDOWS:
+            return True
+        
+        paths_to_setup = [
+            str(vault_root),
+            str(vault_root / "Projects"),
+            str(vault_root / "Skills"),
+        ]
+        
+        # Add discovered binary paths
+        if discovered_bins:
+            for bin_path in discovered_bins:
+                paths_to_setup.append(str(bin_path))
+        
+        # Add all existing project directories
+        projects_dir = vault_root / "Projects"
+        if projects_dir.exists():
+            for item in projects_dir.iterdir():
+                if item.is_dir():
+                    paths_to_setup.append(str(item))
+        
+        success = True
+        for path in paths_to_setup:
+            if path in cls._setup_cache:
+                continue
+            
+            if cls.grant_path_access(path, package_sid, read=True, write=True):
+                cls._setup_cache.add(path)
+            else:
+                success = False
+        
+        return success
+    
+    @classmethod
+    def revoke_path_access(cls, path: str, package_sid: bytes) -> bool:
+        """
+        Revoke AppContainer SID access from a path.
+        
+        Removes the ACE from the DACL.
+        """
+        if not IS_WINDOWS:
+            return True
+        
+        # Remove from cache
+        cls._setup_cache.discard(path)
+        
+        # TODO: Implement actual revocation
+        # This requires reading the current DACL, removing the ACE,
+        # and writing back
+        return True
+
+
+# =============================================================================
 # Path Containment (Defense-in-Depth) - §8.6
 # =============================================================================
 

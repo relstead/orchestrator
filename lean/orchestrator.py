@@ -39,6 +39,11 @@ class OrchestratorState:
     compaction_backoff_until: float = 0
     inbox_backoff_until: float = 0
     orphaned_claims: list[str] = field(default_factory=list)
+    # Snapshot tracking per §8.12
+    snapshot_taken_for: dict[str, tuple[int, str]] = field(default_factory=dict)  # task_id -> (attempt, snapshot_path)
+    # Changeset tracking per §9.2
+    changeset: dict[str, dict] = field(default_factory=dict)  # path -> {status, attempt}
+    compaction_ran_this_cycle: bool = False  # Per §9.4: one compaction per cycle
 
 
 class Orchestrator:
@@ -168,6 +173,9 @@ class Orchestrator:
         """Run a single poll cycle."""
         self._state.poll_count += 1
         
+        # Reset per-cycle flags
+        self._state.compaction_ran_this_cycle = False
+        
         # 1. Stale-claim sweep - recover orphaned doing/ tasks
         self._recover_stale_claims()
         
@@ -200,7 +208,12 @@ class Orchestrator:
                     pass
     
     def _process_inbox(self) -> None:
-        """Process inbox with backoff."""
+        """
+        Process inbox with backoff.
+        
+        Parses inbox content into tasks per §9.5.
+        Supports [project] and @project: syntax.
+        """
         # Check backoff
         if time.time() < self._state.inbox_backoff_until:
             return
@@ -212,9 +225,124 @@ class Orchestrator:
         if not content:
             return
         
-        # In real impl, would call model to decompose inbox
-        # For now, just archive
-        self._archive_inbox_content(content)
+        # Parse inbox into task items
+        task_items = self._parse_inbox_items(content)
+        
+        if not task_items:
+            # No valid tasks found, archive
+            self._archive_inbox_content(content)
+            return
+        
+        # Create tasks from parsed items
+        tasks_created = 0
+        for item in task_items:
+            project = item.get("project")
+            title = item.get("title")
+            body = item.get("body", "")
+            
+            if not title:
+                continue
+            
+            # Use default project if not specified
+            if not project:
+                projects = self._vault.discover_projects()
+                if projects:
+                    project = projects[0]
+                else:
+                    # Create a default project
+                    project = "default"
+                    self._vault.ensure_project_skeleton(project)
+            
+            try:
+                self._task_store.create_task(
+                    project=project,
+                    title=title[:100],  # Truncate title
+                    body=body,
+                    task_type=self._infer_task_type(body),
+                )
+                tasks_created += 1
+            except Exception as e:
+                print(f"Failed to create task: {e}")
+        
+        if tasks_created > 0:
+            # Success - archive processed content
+            self._archive_inbox_content(content)
+            print(f"Created {tasks_created} tasks from inbox")
+        else:
+            # Failed to parse, set backoff and retry later
+            self._state.inbox_backoff_until = time.time() + 60
+    
+    def _parse_inbox_items(self, content: str) -> list[dict]:
+        """
+        Parse inbox content into task items.
+        
+        Supports formats:
+        - [project] Title\nBody
+        - @project: Title\nBody  
+        - Title\nBody (uses default project)
+        - --- separator for multiple items
+        """
+        items = []
+        current_item = None
+        
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for separator
+            if line.startswith("---"):
+                if current_item and current_item.get("title"):
+                    items.append(current_item)
+                current_item = None
+                continue
+            
+            # Check for project prefix
+            project = None
+            if line.startswith("[") and "]" in line:
+                project = line[1:line.index("]")]
+                line = line[line.index("]") + 1:].strip()
+            elif line.startswith("@") and ":" in line:
+                project = line[1:line.index(":")]
+                line = line[line.index(":") + 1:].strip()
+            
+            if current_item is None:
+                current_item = {"project": project, "title": "", "body": ""}
+            elif not current_item["title"]:
+                current_item["title"] = line
+                current_item["project"] = project or current_item.get("project")
+            else:
+                # Body content
+                if current_item["body"]:
+                    current_item["body"] += "\n" + line
+                else:
+                    current_item["body"] = line
+        
+        # Don't forget last item
+        if current_item and current_item.get("title"):
+            items.append(current_item)
+        
+        return items
+    
+    def _infer_task_type(self, body: str) -> str:
+        """
+        Infer task type from body content.
+        
+        Simple heuristic - plan tasks typically contain planning keywords.
+        """
+        body_lower = body.lower()
+        
+        planning_keywords = [
+            "plan", "propose", "design", "architecture",
+            "research", "investigate", "explore", "evaluate",
+            "break down", "subtask", "milestone",
+        ]
+        
+        for keyword in planning_keywords:
+            if keyword in body_lower:
+                return "plan"
+        
+        return "coding"
     
     def _archive_inbox_content(self, content: str) -> None:
         """Archive inbox content to _inbox_archive.md."""
@@ -272,6 +400,11 @@ class Orchestrator:
         
         Per §9.4: at most one compaction per poll cycle across all projects.
         """
+        # Check if already ran this cycle
+        if self._state.compaction_ran_this_cycle:
+            return
+        
+        # Check backoff
         if time.time() < self._state.compaction_backoff_until:
             return
         
@@ -283,6 +416,184 @@ class Orchestrator:
         if count > 0:
             print(f"Compacted {count} events to archive")
             self._state.compaction_backoff_until = time.time() + 60
+            self._state.compaction_ran_this_cycle = True  # Mark as run this cycle
+    
+    # =========================================================================
+    # Snapshot & Rollback - §8.12
+    # =========================================================================
+    
+    def ensure_snapshot(self, task_id: str, attempt: int, project_path: Path) -> str | None:
+        """
+        Take a snapshot before first execute of a task attempt.
+        
+        Per §8.12: Snapshot before first execute per attempt.
+        Copies project directory (excluding tasks/) to _backups/snapshot_<task_id>_<attempt>/
+        
+        Returns the snapshot path, or None if already taken for this task+attempt.
+        """
+        # Check if snapshot already taken for this task+attempt
+        key = (task_id, attempt)
+        if task_id in self._state.snapshot_taken_for:
+            cached_attempt, cached_path = self._state.snapshot_taken_for[task_id]
+            if cached_attempt == attempt:
+                return cached_path  # Already taken
+        
+        # Take snapshot
+        snapshot_dir = self._vault.backups_path / f"snapshot_{task_id}_{attempt}"
+        
+        # Exclude tasks/ directory
+        exclude_patterns = ['tasks', '.git', '__pycache__', '*.pyc']
+        
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        
+        shutil.copytree(
+            project_path,
+            snapshot_dir,
+            dirs_exist_ok=False,
+            ignore=shutil.ignore_patterns(*exclude_patterns),
+        )
+        
+        self._state.snapshot_taken_for[task_id] = (attempt, str(snapshot_dir))
+        return str(snapshot_dir)
+    
+    def rollback_to_snapshot(self, task_id: str) -> bool:
+        """
+        Rollback to the latest snapshot for a task.
+        
+        Returns True if rollback was performed.
+        """
+        if task_id not in self._state.snapshot_taken_for:
+            return False
+        
+        attempt, snapshot_path = self._state.snapshot_taken_for[task_id]
+        snapshot_dir = Path(snapshot_path)
+        
+        if not snapshot_dir.exists():
+            return False
+        
+        # Find project path
+        project = None
+        for p in self._vault.discover_projects():
+            if task_id.startswith(p):
+                project = p
+                break
+        
+        if not project:
+            return False
+        
+        project_path = self._vault.get_project_path(project)
+        
+        # Restore from snapshot
+        for item in snapshot_dir.iterdir():
+            dest = project_path / item.name
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+        
+        return True
+    
+    # =========================================================================
+    # Changeset Tracking - §9.2
+    # =========================================================================
+    
+    def track_write(self, path: str, status: str = "created") -> None:
+        """
+        Track a successful write action in the changeset.
+        
+        Per §9.2: Records path -> {status, attempt} for multi-attempt handoff.
+        """
+        from .tasks import TaskState
+        
+        # Determine current attempt from latest task context
+        attempt = 1
+        for task_id, info in list(self._state.changeset.items()):
+            if "attempt" in info:
+                attempt = max(attempt, info["attempt"] + 1)
+        
+        self._state.changeset[path] = {
+            "status": status,
+            "attempt": attempt,
+            "timestamp": time.time(),
+        }
+    
+    def track_overwrite(self, path: str) -> None:
+        """Track an overwrite (existing file modified)."""
+        self._state.changeset[path] = {
+            "status": "overwritten",
+            "attempt": self._get_current_attempt(),
+            "timestamp": time.time(),
+        }
+    
+    def _get_current_attempt(self) -> int:
+        """Get current task attempt number."""
+        return max([info.get("attempt", 1) for info in self._state.changeset.values()] or [1])
+    
+    def save_changeset(self, task_id: str) -> None:
+        """
+        Save changeset to _backups/changeset_<task_id>.json.
+        
+        Per §9.2: Written at end of every attempt (success, failure, requeue).
+        """
+        changeset_path = self._vault.backups_path / f"changeset_{task_id}.json"
+        
+        with open(changeset_path, "w") as f:
+            json.dump(self._state.changeset, f, indent=2)
+    
+    def load_changeset(self, task_id: str) -> dict[str, dict]:
+        """
+        Load changeset from _backups/changeset_<task_id>.json.
+        
+        Per §9.2: Accumulated across retry attempts.
+        """
+        changeset_path = self._vault.backups_path / f"changeset_{task_id}.json"
+        
+        if not changeset_path.exists():
+            return {}
+        
+        with open(changeset_path) as f:
+            return json.load(f)
+    
+    # =========================================================================
+    # Output Compression - §8.9
+    # =========================================================================
+    
+    def compress_output(self, raw: str, max_chars: int = 4000) -> str:
+        """
+        Compress output if it exceeds threshold.
+        
+        Per §8.9: Returns head(20) + tail(10) summary if too long.
+        Full output is preserved in _backups/.
+        """
+        if len(raw) <= max_chars:
+            return raw
+        
+        # Split into lines
+        lines = raw.splitlines()
+        
+        if len(lines) <= 30:
+            return raw  # Not worth compressing
+        
+        # Take head(20) + tail(10)
+        head = lines[:20]
+        tail = lines[-10:] if len(lines) > 10 else []
+        
+        summary = "\n".join(head)
+        if tail:
+            summary += "\n... [truncated - see _backups/ for full output]"
+            summary += "\n" + "\n".join(tail)
+        
+        return summary
+    
+    def save_full_output(self, task_id: str, turn: int, output: str) -> None:
+        """Save full output to _backups/execute_<task_id>_<turn>.txt."""
+        output_path = self._vault.backups_path / f"execute_{task_id}_{turn}.txt"
+        
+        with open(output_path, "w") as f:
+            f.write(output)
     
     def execute_command(
         self,

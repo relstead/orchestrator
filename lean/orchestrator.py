@@ -256,7 +256,7 @@ class Orchestrator:
                 
                 # Claim task (move to doing)
                 try:
-                    self._task_store.move_task(task, TaskState.DONE)
+                    self._task_store.move_task(task, TaskState.DOING)
                     self._workers.mark_used(worker.name)
                     
                     # In real impl, would spawn worker thread
